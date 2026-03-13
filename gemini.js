@@ -61,7 +61,7 @@ class GeminiService {
       const result = await this.audioModel.generateContent([
         {
           inlineData: {
-            mimeType: 'audio/basic',   // μ-law / .au format
+            mimeType: 'audio/wav',   // μ-law / .au format
             data: base64Audio,
           },
         },

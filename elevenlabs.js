@@ -1,20 +1,6 @@
 // ============================================================
 // src/services/elevenlabs.js — ElevenLabs TTS (NOT Agent)
-//
-// 💡 THE COST TRICK EXPLAINED:
-//
-//  ❌ ElevenLabs Agent mode:
-//     - Their agent handles STT + LLM + TTS + routing
-//     - Costs ~$0.10-0.12/min = ~₹8-10/min
-//     - You have limited control over the LLM logic
-//
-//  ✅ Our approach (TTS only):
-//     - We ONLY call ElevenLabs /v1/text-to-speech endpoint
-//     - Use Gemini for STT + LLM (10x cheaper)
-//     - Still get ElevenLabs' beautiful voice quality
-//     - Full control over conversation logic
-//     - Cost: ~$0.006/1000 chars ≈ ~₹0.50/min = ~₹1/min
-//
+// FIXED: output_format as URL param, ffmpeg codec + error logs
 // ============================================================
 
 import axios from 'axios';
@@ -32,9 +18,8 @@ class ElevenLabsService {
     this.voiceId = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
     this.baseUrl = 'https://api.elevenlabs.io/v1';
 
-    // TTS settings optimized for phone calls
     this.voiceSettings = {
-      stability: 0.5,           // Lower = more expressive
+      stability: 0.5,
       similarity_boost: 0.75,
       style: 0.0,
       use_speaker_boost: true,
@@ -42,59 +27,66 @@ class ElevenLabsService {
   }
 
   // ── Text → MP3 ─────────────────────────────────────────────
+  // FIX: output_format MUST be a URL query param, not in the body
   async textToSpeech(text) {
     try {
+      console.log(`[ElevenLabs] Requesting TTS: "${text.substring(0, 80)}"`);
+
       const response = await axios.post(
-        `${this.baseUrl}/text-to-speech/${this.voiceId}`,
+        `${this.baseUrl}/text-to-speech/${this.voiceId}?output_format=mp3_44100_128`,
         {
           text,
-          model_id: 'eleven_turbo_v2',    // Fastest + cheapest model
+          model_id: 'eleven_turbo_v2_5',
           voice_settings: this.voiceSettings,
-          output_format: 'mp3_22050_32',  // 22kHz, 32kbps — good for phone
         },
         {
           headers: {
             'xi-api-key': this.apiKey,
             'Content-Type': 'application/json',
-            'Accept': 'audio/mpeg',
           },
           responseType: 'arraybuffer',
-          timeout: 10000,
+          timeout: 15000,
         }
       );
 
-      return Buffer.from(response.data);
+      const buf = Buffer.from(response.data);
+      console.log(`[ElevenLabs] TTS success: ${buf.length} bytes`);
+      return buf;
 
     } catch (err) {
       const status = err.response?.status;
-      const detail = err.response?.data ? Buffer.from(err.response.data).toString() : err.message;
+      const detail = err.response?.data
+        ? Buffer.from(err.response.data).toString()
+        : err.message;
       console.error(`[ElevenLabs] TTS error ${status}: ${detail}`);
       throw new Error(`TTS failed: ${detail}`);
     }
   }
 
   // ── MP3 → μ-law (for Twilio) ───────────────────────────────
-  // Twilio Media Streams require: μ-law, 8kHz, mono, 8-bit
+  // FIX: use -codec:a pcm_mulaw (not just -f mulaw), show errors
   async mp3ToMulaw(mp3Buffer) {
-    const tmpId = Date.now();
-    const inPath = join(tmpdir(), `in_${tmpId}.mp3`);
-    const outPath = join(tmpdir(), `out_${tmpId}.ul`);
+    const tmpId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const inPath = join(tmpdir(), `tts_in_${tmpId}.mp3`);
+    const outPath = join(tmpdir(), `tts_out_${tmpId}.raw`);
 
     try {
       await writeFile(inPath, mp3Buffer);
 
-      // ffmpeg: MP3 → μ-law PCM @ 8kHz mono
-      await execAsync(
-        `ffmpeg -y -i "${inPath}" -ar 8000 -ac 1 -f mulaw "${outPath}" 2>/dev/null`
-      );
+      const cmd = `ffmpeg -y -i "${inPath}" -codec:a pcm_mulaw -ar 8000 -ac 1 -f mulaw "${outPath}"`;
+      console.log(`[ffmpeg] Running: ${cmd}`);
+
+      await execAsync(cmd).catch(e => {
+        throw new Error(`ffmpeg conversion failed: ${e.stderr || e.message}`);
+      });
 
       const mulawBuffer = await readFile(outPath);
+      console.log(`[ffmpeg] μ-law output: ${mulawBuffer.length} bytes`);
       return mulawBuffer;
 
     } finally {
-      // Cleanup temp files
-      unlink(inPath).catch(() => {});
-      unlink(outPath).catch(() => {});
+      unlink(inPath).catch(() => { });
+      unlink(outPath).catch(() => { });
     }
   }
 

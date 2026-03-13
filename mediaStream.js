@@ -1,24 +1,15 @@
 // ============================================================
 // src/services/mediaStream.js — Core Call Orchestrator
-//
-// FLOW:
-//  Twilio sends μ-law audio chunks via WebSocket (Twilio Media Stream)
-//  → We buffer + detect silence (VAD)
-//  → Convert μ-law to PCM → send to Gemini for STT
-//  → Gemini LLM generates response text
-//  → ElevenLabs converts text to MP3 (TTS only, NOT agent)
-//  → MP3 converted to μ-law → sent back to Twilio
-//
-// COST TRICK:
-//  ElevenLabs Agent = processes your entire call = ~₹8/min
-//  Our approach = ElevenLabs only for TTS synthesis = ~₹1/min
+// FIXED:
+//  1. Greeting delayed 1s so Twilio stream is ready
+//  2. μ-law buffer wrapped with WAV header for Gemini STT
+//  3. Better error logging throughout
 // ============================================================
 
 import { geminiService } from './gemini.js';
 import { elevenLabsService } from './elevenlabs.js';
 import { freshsalesService } from './freshsales.js';
 
-// Active call sessions: Map<callSid, SessionState>
 export const activeSessions = new Map();
 
 // ── Session State Factory ────────────────────────────────────
@@ -28,10 +19,10 @@ function createSession(callSid, params) {
     phone: params.callerPhone || params.calledPhone || 'unknown',
     direction: params.direction || 'inbound',
     startedAt: new Date(),
-    history: [],              // Conversation history for Gemini
-    audioBuffer: [],          // Buffered μ-law audio chunks
-    isProcessing: false,      // Prevent overlapping LLM calls
-    streamSid: null,          // Twilio stream SID (for sending audio back)
+    history: [],
+    audioBuffer: [],
+    isProcessing: false,
+    streamSid: null,
     silenceTimer: null,
     hasGreeted: false,
     ws: null,
@@ -59,36 +50,29 @@ export function handleMediaStream(ws) {
         session.ws = ws;
         activeSessions.set(callSid, session);
 
-        console.log(`[Stream] Call started | SID: ${callSid} | ${session.direction} | Phone: ${session.phone}`);
+        console.log(`[Stream] Started | SID: ${callSid} | ${session.direction} | ${session.phone}`);
 
-        // Greet the caller using ElevenLabs TTS
-        await sendGreeting(session);
+        // FIX: wait 1s for Twilio stream to be fully ready before sending audio
+        setTimeout(() => sendGreeting(session).catch(console.error), 1000);
         break;
       }
 
       case 'media': {
         if (!session || session.isProcessing) break;
-
-        // Twilio sends base64-encoded μ-law (mulaw) audio
         const chunk = Buffer.from(msg.media.payload, 'base64');
         session.audioBuffer.push(chunk);
-
-        // VAD: reset silence timer on each audio chunk
         resetSilenceTimer(session);
         break;
       }
 
       case 'stop':
-        console.log(`[Stream] Call ended | SID: ${session?.callSid}`);
+        console.log(`[Stream] Stopped | SID: ${session?.callSid}`);
         if (session) cleanup(session);
         break;
     }
   });
 
-  ws.on('close', () => {
-    if (session) cleanup(session);
-  });
-
+  ws.on('close', () => { if (session) cleanup(session); });
   ws.on('error', (err) => {
     console.error('[Stream] WS error:', err.message);
     if (session) cleanup(session);
@@ -107,10 +91,11 @@ async function sendGreeting(session) {
   session.history.push({ role: 'model', parts: [{ text: greeting }] });
   session.hasGreeted = true;
 
+  console.log(`[Stream] Sending greeting: "${greeting}"`);
   await speakToUser(session, greeting);
 }
 
-// ── Silence Detection → Process Speech ──────────────────────
+// ── Silence Detection → Trigger STT ─────────────────────────
 function resetSilenceTimer(session) {
   if (session.silenceTimer) clearTimeout(session.silenceTimer);
 
@@ -119,7 +104,6 @@ function resetSilenceTimer(session) {
   session.silenceTimer = setTimeout(async () => {
     if (session.audioBuffer.length === 0 || session.isProcessing) return;
 
-    // Grab buffered audio and clear
     const audioData = Buffer.concat(session.audioBuffer);
     session.audioBuffer = [];
     session.isProcessing = true;
@@ -138,38 +122,32 @@ function resetSilenceTimer(session) {
 async function processUserSpeech(session, audioBuffer) {
   console.log(`[Stream] Processing ${audioBuffer.length} bytes of audio`);
 
-  // 1. Transcribe with Gemini (STT)
-  const transcript = await geminiService.transcribeAudio(audioBuffer);
+  // FIX: wrap raw μ-law in WAV header so Gemini can parse it
+  const wavBuffer = mulawToWav(audioBuffer);
+
+  const transcript = await geminiService.transcribeAudio(wavBuffer);
   if (!transcript || transcript.trim().length < 2) {
-    console.log('[Stream] Empty transcript, skipping');
+    console.log('[Stream] Empty/short transcript, skipping');
     return;
   }
 
-  console.log(`[Stream] User said: "${transcript}"`);
-
-  // 2. Add to conversation history
+  console.log(`[Stream] User: "${transcript}"`);
   session.history.push({ role: 'user', parts: [{ text: transcript }] });
 
-  // 3. Generate AI response with Gemini (LLM)
   const aiResponse = await geminiService.chat(session.history, {
     phone: session.phone,
     direction: session.direction,
   });
 
-  console.log(`[Stream] AI response: "${aiResponse}"`);
-
-  // 4. Add AI response to history
+  console.log(`[Stream] Agent: "${aiResponse}"`);
   session.history.push({ role: 'model', parts: [{ text: aiResponse }] });
 
-  // 5. Convert to speech via ElevenLabs TTS & send back
   await speakToUser(session, aiResponse);
 
-  // 6. Check for call-end signals
   if (shouldEndCall(aiResponse)) {
     setTimeout(() => endCall(session), 3000);
   }
 
-  // 7. Update CRM with transcript
   freshsalesService.logConversationTurn({
     phone: session.phone,
     userSaid: transcript,
@@ -181,39 +159,32 @@ async function processUserSpeech(session, audioBuffer) {
 // ── TTS → Send Audio to Twilio ───────────────────────────────
 async function speakToUser(session, text) {
   try {
-    // Get MP3 from ElevenLabs TTS (cheap — not their agent)
     const mp3Buffer = await elevenLabsService.textToSpeech(text);
-
-    // Convert MP3 → μ-law (8kHz, mono) for Twilio
     const mulawBuffer = await elevenLabsService.mp3ToMulaw(mp3Buffer);
-
-    // Send to Twilio via WebSocket media message
     sendAudioToTwilio(session, mulawBuffer);
-
-    console.log(`[Stream] Sent ${mulawBuffer.length} bytes of audio to caller`);
+    console.log(`[Stream] Audio sent: ${mulawBuffer.length} bytes`);
   } catch (err) {
-    console.error('[Stream] TTS error:', err.message);
+    console.error('[Stream] speakToUser error:', err.message);
   }
 }
 
-// ── Send Audio Buffer to Twilio ──────────────────────────────
+// ── Send μ-law Audio to Twilio via WebSocket ─────────────────
 function sendAudioToTwilio(session, audioBuffer) {
-  if (!session.ws || session.ws.readyState !== 1) return;
+  if (!session.ws || session.ws.readyState !== 1) {
+    console.warn('[Stream] WS not open, cannot send audio');
+    return;
+  }
 
-  // Split into 20ms chunks (Twilio requires small chunks)
-  const CHUNK_SIZE = 320; // 20ms @ 8kHz μ-law
+  const CHUNK_SIZE = 320; // 20ms @ 8kHz
   for (let i = 0; i < audioBuffer.length; i += CHUNK_SIZE) {
     const chunk = audioBuffer.slice(i, i + CHUNK_SIZE);
     session.ws.send(JSON.stringify({
       event: 'media',
       streamSid: session.streamSid,
-      media: {
-        payload: chunk.toString('base64'),
-      },
+      media: { payload: chunk.toString('base64') },
     }));
   }
 
-  // Mark end of audio
   session.ws.send(JSON.stringify({
     event: 'mark',
     streamSid: session.streamSid,
@@ -221,19 +192,51 @@ function sendAudioToTwilio(session, audioBuffer) {
   }));
 }
 
+// ── FIX: Wrap raw μ-law PCM in WAV header for Gemini ─────────
+// Gemini needs a proper audio container, not raw PCM bytes
+function mulawToWav(mulawBuffer) {
+  const sampleRate = 8000;
+  const numChannels = 1;
+  const bitsPerSample = 8;
+  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+  const blockAlign = numChannels * (bitsPerSample / 8);
+  const dataSize = mulawBuffer.length;
+  const headerSize = 44;
+
+  const wav = Buffer.alloc(headerSize + dataSize);
+
+  // RIFF header
+  wav.write('RIFF', 0, 'ascii');
+  wav.writeUInt32LE(36 + dataSize, 4);
+  wav.write('WAVE', 8, 'ascii');
+
+  // fmt chunk — audio format 7 = μ-law
+  wav.write('fmt ', 12, 'ascii');
+  wav.writeUInt32LE(16, 16);          // Chunk size
+  wav.writeUInt16LE(7, 20);           // Audio format: 7 = μ-law
+  wav.writeUInt16LE(numChannels, 22);
+  wav.writeUInt32LE(sampleRate, 24);
+  wav.writeUInt32LE(byteRate, 28);
+  wav.writeUInt16LE(blockAlign, 32);
+  wav.writeUInt16LE(bitsPerSample, 34);
+
+  // data chunk
+  wav.write('data', 36, 'ascii');
+  wav.writeUInt32LE(dataSize, 40);
+  mulawBuffer.copy(wav, 44);
+
+  return wav;
+}
+
 // ── Call End Detection ───────────────────────────────────────
 function shouldEndCall(text) {
-  const endPhrases = ['goodbye', 'bye', 'take care', 'have a great day', 'talk to you soon', 'end this call'];
+  const endPhrases = ['goodbye', 'bye', 'take care', 'have a great day', 'talk to you soon'];
   return endPhrases.some(p => text.toLowerCase().includes(p));
 }
 
 function endCall(session) {
   if (session.ws && session.ws.readyState === 1) {
-    session.ws.send(JSON.stringify({
-      event: 'clear',
-      streamSid: session.streamSid,
-    }));
-    // Twilio will detect silence and end the call
+    session.ws.send(JSON.stringify({ event: 'clear', streamSid: session.streamSid }));
   }
 }
 
@@ -241,5 +244,5 @@ function endCall(session) {
 function cleanup(session) {
   if (session.silenceTimer) clearTimeout(session.silenceTimer);
   activeSessions.delete(session.callSid);
-  console.log(`[Stream] Session cleaned up | SID: ${session.callSid} | Turns: ${Math.floor(session.history.length / 2)}`);
+  console.log(`[Stream] Cleaned up | SID: ${session.callSid} | Turns: ${Math.floor(session.history.length / 2)}`);
 }

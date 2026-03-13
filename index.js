@@ -9,9 +9,9 @@ import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import dotenv from 'dotenv';
-import { twilioRoutes } from './routes/twilio.js';
-import { callRoutes } from './routes/calls.js';
-import { handleMediaStream } from './services/mediaStream.js';
+import { twilioRoutes } from './twilio.js';
+import { callRoutes } from './calls.js';
+import { handleMediaStream } from './mediaStream.js';
 
 dotenv.config();
 
@@ -22,6 +22,16 @@ app.use(express.urlencoded({ extended: true }));
 // ── Routes ──────────────────────────────────────────────────
 app.use('/twilio', twilioRoutes);
 app.use('/calls', callRoutes);
+
+app.get('/', (_, res) => res.json({
+  message: 'AI Calling Backend is running!',
+  endpoints: {
+    health: '/health',
+    twilio: '/twilio',
+    calls: '/calls'
+  },
+  docs: 'Check README.md for API documentation'
+}));
 
 app.get('/health', (_, res) => res.json({
   status: 'ok',
@@ -38,7 +48,7 @@ wss.on('connection', (ws, req) => {
   handleMediaStream(ws);
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`
 ╔══════════════════════════════════════════════════════╗

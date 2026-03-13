@@ -9,7 +9,7 @@
 
 import { Router } from 'express';
 import twilio from 'twilio';
-import { freshsalesService } from '../services/freshsales.js';
+import { freshsalesService } from './freshsales.js';
 
 const { twiml: { VoiceResponse } } = twilio;
 const router = Router();

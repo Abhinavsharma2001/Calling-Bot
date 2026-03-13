@@ -8,7 +8,7 @@
 
 import { Router } from 'express';
 import twilio from 'twilio';
-import { activeSessions } from '../services/mediaStream.js';
+import { activeSessions } from './mediaStream.js';
 
 const router = Router();
 const twilioClient = twilio(

@@ -5,15 +5,15 @@
 // Cost: ~₹1/min vs ₹8/min with ElevenLabs native agent
 // ============================================================
 
+import dotenv from 'dotenv';
+dotenv.config();
+
 import express from 'express';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
-import dotenv from 'dotenv';
 import { twilioRoutes } from './twilio.js';
 import { callRoutes } from './calls.js';
 import { handleMediaStream } from './mediaStream.js';
-
-dotenv.config();
 
 const app = express();
 app.use(express.json());

@@ -11,7 +11,7 @@ import twilio from 'twilio';
 import { activeSessions } from './mediaStream.js';
 
 const router = Router();
-const twilioClient = twilio(
+const getTwilioClient = () => twilio(
   process.env.TWILIO_ACCOUNT_SID,
   process.env.TWILIO_AUTH_TOKEN
 );
@@ -25,6 +25,11 @@ router.post('/outbound', async (req, res) => {
   }
 
   try {
+    console.log("Calling:", to);
+    console.log("From:", process.env.TWILIO_PHONE_NUMBER);
+    console.log("Webhook:", `${process.env.BASE_URL}/twilio/outbound`);
+
+    const twilioClient = getTwilioClient();
     const call = await twilioClient.calls.create({
       to,
       from: process.env.TWILIO_PHONE_NUMBER,
@@ -46,7 +51,7 @@ router.post('/outbound', async (req, res) => {
     });
 
   } catch (err) {
-    console.error('[Calls] Outbound error:', err.message);
+    console.error("FULL ERROR:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -69,6 +74,7 @@ router.get('/active', (req, res) => {
 // ── End a Call ───────────────────────────────────────────────
 router.post('/:sid/end', async (req, res) => {
   try {
+    const twilioClient = getTwilioClient();
     await twilioClient.calls(req.params.sid).update({ status: 'completed' });
     res.json({ success: true });
   } catch (err) {

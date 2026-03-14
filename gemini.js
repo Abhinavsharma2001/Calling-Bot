@@ -148,7 +148,13 @@ class GeminiService {
       const last = turns[turns.length - 1];
       if (!last || last.role !== 'user') return "Sorry, could you say that again?";
 
-      const chat = model.startChat({ history: turns.slice(0, -1) });
+      // Gemini strictly requires history to start with a 'user' role
+      const chatHistory = turns.slice(0, -1);
+      if (chatHistory.length > 0 && chatHistory[0].role === 'model') {
+        chatHistory.shift();
+      }
+
+      const chat = model.startChat({ history: chatHistory });
       const res = await chat.sendMessage(last.parts[0].text);
       const text = res.response.text().trim();
       console.log(`[Gemini LLM] "${text}"`);

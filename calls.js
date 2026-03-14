@@ -6,6 +6,7 @@
 // POST /calls/:sid/end   — hang up a call
 // ============================================================
 
+import './env.js';
 import { Router } from 'express';
 import twilio from 'twilio';
 import { activeSessions } from './mediaStream.js';

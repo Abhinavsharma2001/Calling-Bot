@@ -49,6 +49,7 @@ class FreshsalesService {
       const createRes = await this.client.post('/contacts', {
         contact: {
           mobile_number: phone,
+          email: `call_${Date.now()}@placeholder.ai`,
           lead_source_id: 3,         // Phone — adjust based on your Freshsales setup
           custom_field: {
             call_sid: callSid,

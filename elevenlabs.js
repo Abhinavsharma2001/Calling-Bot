@@ -1,105 +1,70 @@
 // ============================================================
-// src/services/elevenlabs.js — ElevenLabs TTS (NOT Agent)
-// FIXED: output_format as URL param, ffmpeg codec + error logs
+// src/services/elevenlabs.js — ElevenLabs TTS only (not agent)
+// FIXED: mp3ToMulaw is fully async/await using promises
 // ============================================================
-
 import axios from 'axios';
 import { exec } from 'child_process';
-import { promisify } from 'util';
 import { writeFile, readFile, unlink } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
-const execAsync = promisify(exec);
-
 class ElevenLabsService {
-  constructor() {
-    this.apiKey = process.env.ELEVENLABS_API_KEY;
-    this.voiceId = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
-    this.baseUrl = 'https://api.elevenlabs.io/v1';
 
-    this.voiceSettings = {
-      stability: 0.5,
-      similarity_boost: 0.75,
-      style: 0.0,
-      use_speaker_boost: true,
-    };
-  }
-
-  // ── Text → MP3 ─────────────────────────────────────────────
-  // FIX: output_format MUST be a URL query param, not in the body
   async textToSpeech(text) {
-    try {
-      console.log(`[ElevenLabs] Requesting TTS: "${text.substring(0, 80)}"`);
+    const apiKey = process.env.ELEVENLABS_API_KEY;
+    const voiceId = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
 
-      const response = await axios.post(
-        `${this.baseUrl}/text-to-speech/${this.voiceId}?output_format=mp3_44100_128`,
-        {
-          text,
-          model_id: 'eleven_turbo_v2_5',
-          voice_settings: this.voiceSettings,
-        },
-        {
-          headers: {
-            'xi-api-key': this.apiKey,
-            'Content-Type': 'application/json',
-          },
-          responseType: 'arraybuffer',
-          timeout: 15000,
-        }
-      );
+    console.log(`[ElevenLabs] Requesting TTS: "${text.slice(0, 80)}"`);
 
-      const buf = Buffer.from(response.data);
-      console.log(`[ElevenLabs] TTS success: ${buf.length} bytes`);
-      return buf;
+    const res = await axios.post(
+      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`,
+      {
+        text,
+        model_id: 'eleven_turbo_v2_5',
+        voice_settings: { stability: 0.4, similarity_boost: 0.8, style: 0.0, use_speaker_boost: true },
+      },
+      {
+        headers: { 'xi-api-key': apiKey, 'Content-Type': 'application/json' },
+        responseType: 'arraybuffer',
+        timeout: 15000,
+      }
+    ).catch(err => {
+      const msg = err.response?.data ? Buffer.from(err.response.data).toString() : err.message;
+      throw new Error(`[ElevenLabs] TTS failed (${err.response?.status}): ${msg}`);
+    });
 
-    } catch (err) {
-      const status = err.response?.status;
-      const detail = err.response?.data
-        ? Buffer.from(err.response.data).toString()
-        : err.message;
-      console.error(`[ElevenLabs] TTS error ${status}: ${detail}`);
-      throw new Error(`TTS failed: ${detail}`);
-    }
+    const buf = Buffer.from(res.data);
+    console.log(`[ElevenLabs] TTS success: ${buf.length} bytes`);
+    return buf;
   }
 
-  // ── MP3 → μ-law (for Twilio) ───────────────────────────────
-  // FIX: use -codec:a pcm_mulaw (not just -f mulaw), show errors
+  // FIXED: fully async — awaits ffmpeg before returning
   async mp3ToMulaw(mp3Buffer) {
-    const tmpId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    const inPath = join(tmpdir(), `tts_in_${tmpId}.mp3`);
-    const outPath = join(tmpdir(), `tts_out_${tmpId}.raw`);
+    const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const inp = join(tmpdir(), `el_in_${id}.mp3`);
+    const out = join(tmpdir(), `el_out_${id}.raw`);
 
     try {
-      await writeFile(inPath, mp3Buffer);
+      await writeFile(inp, mp3Buffer);
 
-      const cmd = `ffmpeg -y -i "${inPath}" -codec:a pcm_mulaw -ar 8000 -ac 1 -f mulaw "${outPath}"`;
-      console.log(`[ffmpeg] Running: ${cmd}`);
-
-      await execAsync(cmd).catch(e => {
-        throw new Error(`ffmpeg conversion failed: ${e.stderr || e.message}`);
+      // Run ffmpeg and wait for it to finish
+      await new Promise((resolve, reject) => {
+        const cmd = `ffmpeg -y -i "${inp}" -ar 8000 -ac 1 -codec:a pcm_mulaw -f mulaw "${out}"`;
+        console.log(`[ffmpeg] Running: ${cmd}`);
+        exec(cmd, (error, stdout, stderr) => {
+          if (error) reject(new Error(`ffmpeg failed: ${stderr || error.message}`));
+          else resolve();
+        });
       });
 
-      const mulawBuffer = await readFile(outPath);
-      console.log(`[ffmpeg] μ-law output: ${mulawBuffer.length} bytes`);
-      return mulawBuffer;
+      const buf = await readFile(out);
+      console.log(`[ffmpeg] μ-law output: ${buf.length} bytes`);
+      return buf;
 
     } finally {
-      unlink(inPath).catch(() => { });
-      unlink(outPath).catch(() => { });
+      unlink(inp).catch(() => { });
+      unlink(out).catch(() => { });
     }
-  }
-
-  // ── List Available Voices ──────────────────────────────────
-  async listVoices() {
-    const response = await axios.get(`${this.baseUrl}/voices`, {
-      headers: { 'xi-api-key': this.apiKey },
-    });
-    return response.data.voices.map(v => ({
-      id: v.voice_id,
-      name: v.name,
-      preview: v.preview_url,
-    }));
   }
 }
 

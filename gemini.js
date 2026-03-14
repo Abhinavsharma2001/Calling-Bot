@@ -1,112 +1,105 @@
 // ============================================================
-// src/services/gemini.js — Google Gemini (STT + LLM)
-//
-// WHY GEMINI?
-//  Gemini Flash is ~10x cheaper than GPT-4 for same quality.
-//  It also does audio transcription natively (no Whisper cost).
-//
-// COSTS (approx):
-//  Gemini 1.5 Flash: $0.075/1M input tokens (text)
-//  Gemini 1.5 Flash: $0.0015/min (audio)
-//  vs ElevenLabs Agent: ~$0.10/min (STT + LLM + routing)
+// src/services/gemini.js — Gemini STT + LLM
 // ============================================================
-
 import { GoogleGenerativeAI } from '@google/generative-ai';
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+let genAI;
+function getGenAI() {
+  if (!genAI) genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+  return genAI;
+}
 
-// System prompt — customize this for your use case
-const SYSTEM_PROMPT = `You are ${process.env.AGENT_NAME || 'Aria'}, a friendly and professional AI assistant for ${process.env.COMPANY_NAME || 'our company'}.
+const SYSTEM_PROMPT = `You are a professional and friendly calling agent from CareerGuide. CareerGuide provides certification and training courses for career counselling, psychometric testing, and professional development.
+
+LANGUAGE RULES:
+- Automatically detect the language the user speaks.
+- If the user speaks English, reply in English.
+- If the user speaks Hindi, reply in Hindi.
+- If the user switches language, switch to the same language.
+- Speak naturally like a real human.
+
+YOUR GOALS:
+1. Greet the user politely and introduce yourself as CareerGuide support team.
+2. Ask the user's full name and use their name in conversation.
+3. Ask if they have already enrolled in any CareerGuide course.
+4. If already enrolled, ask which course and offer help.
+5. If not enrolled, ask about their background (student, working professional, teacher, counselor, etc.).
+6. Recommend the most relevant course based on their background.
+7. Offer to share enrollment link: https://course.careerguide.com/home
+8. Answer questions about courses, fees, and benefits.
+9. Keep responses short, clear, and human-like.
+10. Ask only one question at a time.
+
+COURSE LIST WITH PRICE:
+CareerGuide offers these certification courses:
+• Certification Course for Guiding School Students – ₹10,000
+• Certification Course for Guiding College Students – ₹7,500
+• Certification Course for Guiding Working Professionals – ₹5,000
+• Certification Course for Study Abroad Guidance – ₹10,000
+• Personal Branding & Sales for Career Counsellors – ₹5,000
+• Become Psychometric Assessor Certification Course for Counsellors – ₹7,500
+• Ready to Use Checklist & PPTs – ₹3,000
+• Master Career Guide Certification (Full Bundle) – ₹27,000
+
+RECOMMENDATION RULES:
+- If user is a teacher or counselor → recommend School Students or Psychometric Assessor course.
+- If user works in corporate → recommend Working Professionals, School Students, or Study Abroad course.
+- If user wants full career counselor certification → recommend Master Career Guide Certification.
+- If user is a beginner → recommend School Students or Study Abroad course.
+
+CALL ENDING RULES:
+- When conversation is complete, politely thank the user.
+- Say goodbye clearly. Example:
+  English: "Thank you for your time. I will share the course details with you. Have a great day. Goodbye."
+  Hindi: "Thank you. Main aapko course details share kar dungi. Aapka din shubh ho. Goodbye."
+- End the call after saying goodbye.
+- Do not remain silent or continue speaking after goodbye.
 
 PERSONALITY:
-- Warm, professional, and concise
-- Speak naturally as if on a phone call
-- Keep responses SHORT (1-3 sentences max) — this is voice, not text
-- Never use bullet points, markdown, or lists in your responses
-
-YOUR GOAL:
-- Understand what the caller needs
-- Collect relevant information (name, requirement, budget)
-- Qualify the lead and offer next steps
-- If asked something you don't know, say "Let me check that for you" and offer a callback
-
-RULES:
-- Never reveal you are an AI unless directly asked
-- Never make up facts about products or pricing
-- If the caller wants to speak to a human, say: "Of course! Let me arrange that for you right away."
-- End calls politely when the conversation is complete
-
-LANGUAGE: Respond in the same language the caller uses.`;
+- Friendly, professional, and helpful.
+- Speak like a real human on a phone call.
+- Never use bullet points, markdown, numbers, or lists in your spoken responses.
+- Keep every reply to 1-3 short sentences maximum.
+- Always wait for the user's response — ask only ONE question at a time.
+- Never say "Certainly!", "Absolutely!", or "Great!" robotically — respond naturally.`;
 
 class GeminiService {
-  constructor() {
-    this.model = genAI.getGenerativeModel({
-      model: process.env.GEMINI_MODEL || 'gemini-1.5-flash',
-      systemInstruction: SYSTEM_PROMPT,
-    });
 
-    // Separate model instance for audio transcription
-    this.audioModel = genAI.getGenerativeModel({
-      model: 'gemini-1.5-flash',
-    });
-  }
-
-  // ── Transcribe Audio (STT) ─────────────────────────────────
-  // Takes μ-law audio buffer, returns transcript string
-  async transcribeAudio(mulawBuffer) {
+  async transcribe(wavBuffer) {
     try {
-      // Convert buffer to base64
-      const base64Audio = mulawBuffer.toString('base64');
-
-      const result = await this.audioModel.generateContent([
-        {
-          inlineData: {
-            mimeType: 'audio/wav',   // μ-law / .au format
-            data: base64Audio,
-          },
-        },
-        {
-          text: 'Transcribe the speech in this audio clip. Return ONLY the transcribed text, nothing else. If there is no speech or the audio is silent, return an empty string.',
-        },
+      const model = getGenAI().getGenerativeModel({ model: 'gemini-1.5-flash' });
+      const result = await model.generateContent([
+        { inlineData: { mimeType: 'audio/wav', data: wavBuffer.toString('base64') } },
+        { text: 'Transcribe this phone call audio exactly as spoken. Return ONLY the spoken words. If silent or no speech detected, return empty string.' },
       ]);
-
-      const transcript = result.response.text().trim();
-      return transcript === '""' ? '' : transcript;
-
-    } catch (err) {
-      console.error('[Gemini] Transcription error:', err.message);
+      const text = result.response.text().trim().replace(/^["']|["']$/g, '');
+      if (text) console.log(`[Gemini STT] "${text}"`);
+      return text;
+    } catch (e) {
+      console.error('[Gemini STT] Error:', e.message);
       return '';
     }
   }
 
-  // ── Chat Response (LLM) ────────────────────────────────────
-  // Takes conversation history, returns AI response string
-  async chat(history, context = {}) {
+  async reply(history) {
     try {
-      // Build context-aware history (max last 10 turns to save tokens)
-      const recentHistory = history.slice(-10);
+      const model = getGenAI().getGenerativeModel({
+        model: process.env.GEMINI_MODEL || 'gemini-1.5-flash',
+        systemInstruction: SYSTEM_PROMPT,
+      });
 
-      // Separate last user message from history
-      const messages = recentHistory.slice(0, -1);
-      const lastMessage = recentHistory[recentHistory.length - 1];
+      const turns = history.slice(-12);
+      const last = turns[turns.length - 1];
+      if (!last || last.role !== 'user') return "Sorry, could you say that again?";
 
-      if (!lastMessage || lastMessage.role !== 'user') {
-        return "I'm sorry, could you repeat that?";
-      }
-
-      // Add caller context to the prompt
-      const contextNote = context.phone
-        ? `[Caller info: Phone: ${context.phone}, Direction: ${context.direction}]\n\n`
-        : '';
-
-      const chat = this.model.startChat({ history: messages });
-      const result = await chat.sendMessage(contextNote + lastMessage.parts[0].text);
-
-      return result.response.text().trim();
-
-    } catch (err) {
-      console.error('[Gemini] Chat error:', err.message);
-      return "I'm sorry, I didn't catch that. Could you say that again?";
+      const chat = model.startChat({ history: turns.slice(0, -1) });
+      const res = await chat.sendMessage(last.parts[0].text);
+      const text = res.response.text().trim();
+      console.log(`[Gemini LLM] "${text}"`);
+      return text;
+    } catch (e) {
+      console.error('[Gemini LLM] Error:', e.message);
+      return "I'm sorry, I didn't catch that. Could you repeat?";
     }
   }
 }

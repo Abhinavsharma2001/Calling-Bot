@@ -55,8 +55,6 @@ export function handleMediaStream(ws) {
         if (S.isProcessing) break;
 
         const chunk = Buffer.from(msg.media.payload, 'base64');
-        // FIXED: very loose threshold — accept almost everything
-        // Indian phone lines have lots of compression artifacts
         if (hasAudio(chunk)) {
           S.audioChunks.push(chunk);
         }
@@ -114,32 +112,45 @@ function armSilenceTimer(S) {
   if (S.silenceTimer) clearTimeout(S.silenceTimer);
   if (S.isSpeaking || S.isProcessing) return;
 
-  // FIXED: 1800ms silence = user finished speaking
   const SILENCE_MS = parseInt(process.env.SILENCE_TIMEOUT_MS) || 1800;
+  const MAX_CHUNKS = 600; // ~12 seconds of audio max (600 * 20ms)
 
-  S.silenceTimer = setTimeout(async () => {
+  // Force process if we've collected too much (e.g., continuous background noise)
+  if (S.audioChunks.length >= MAX_CHUNKS) {
+    console.log(`[Agent] ⚠️ Max listening duration reached, forcing process...`);
+    processAudioBuffer(S);
+    return;
+  }
+
+  S.silenceTimer = setTimeout(() => {
     if (S.isSpeaking || S.isProcessing) return;
+    
+    console.log(`[Agent] ⏱️ Silence timer fired! Chunks in buffer: ${S.audioChunks.length}`);
 
-    // Need at least 8 chunks (~160ms) of audio to bother transcribing
     if (S.audioChunks.length < 8) {
+      console.log(`[Agent] 🗑️ Buffer too small (< 8 chunks), discarding.`);
       S.audioChunks = [];
       return;
     }
 
-    const audio = Buffer.concat(S.audioChunks);
-    S.audioChunks = [];
-    S.isProcessing = true;
-
-    console.log(`[Agent] 🎤 Processing ${audio.length} bytes of audio...`);
-
-    try {
-      await processTurn(S, audio);
-    } catch (e) {
-      console.error('[Agent] Turn error:', e.message);
-    } finally {
-      S.isProcessing = false;
-    }
+    processAudioBuffer(S);
   }, SILENCE_MS);
+}
+
+async function processAudioBuffer(S) {
+  const audio = Buffer.concat(S.audioChunks);
+  S.audioChunks = [];
+  S.isProcessing = true;
+
+  console.log(`[Agent] 🎤 Processing ${audio.length} bytes of audio...`);
+
+  try {
+    await processTurn(S, audio);
+  } catch (e) {
+    console.error('[Agent] Turn error:', e.message);
+  } finally {
+    S.isProcessing = false;
+  }
 }
 
 // ── One conversation turn ─────────────────────────────────────
@@ -246,15 +257,15 @@ function teardown(S) {
   console.log(`[Agent] 🧹 Done | SID: ${S.callSid} | Turns: ${Math.floor(S.history.length / 2)}\n`);
 }
 
-// ── Voice detection — FIXED: very loose for phone audio ──────
-// μ-law 0xFF = silence. But phone lines compress differently.
-// Use a very low threshold so we don't miss real speech.
+// ── Voice detection — FIXED: stricter threshold for background noise ─
+// μ-law: 0xFF/0x7F/0x00 is usually silence. Phone lines compress differently,
+// but 2% was too low and caught line hiss. 8% requires actual speech.
 function hasAudio(chunk) {
   let voice = 0;
   for (const b of chunk) {
     if (b !== 0xFF && b !== 0x7F && b !== 0x00) voice++;
   }
-  return voice / chunk.length > 0.02; // just 2% — accept almost everything
+  return voice / chunk.length > 0.08; 
 }
 
 // ── Wrap μ-law bytes in WAV container for Gemini ─────────────

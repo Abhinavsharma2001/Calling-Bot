@@ -55,11 +55,17 @@ export function handleMediaStream(ws) {
         if (S.isProcessing) break;
 
         const chunk = Buffer.from(msg.media.payload, 'base64');
-        if (hasAudio(chunk)) {
+        const chunkHasAudio = hasAudio(chunk);
+        
+        if (chunkHasAudio) {
           S.audioChunks.push(chunk);
+          // Only restart the silence timer when there IS speech
+          // This way it properly counts down once user stops talking
+          armSilenceTimer(S);
+        } else if (S.audioChunks.length > 0 && !S.silenceTimer) {
+          // User has spoken before but silence timer somehow died — rearm
+          armSilenceTimer(S);
         }
-
-        armSilenceTimer(S);
         break;
       }
 
@@ -259,15 +265,27 @@ function teardown(S) {
   console.log(`[Agent] 🧹 Done | SID: ${S.callSid} | Turns: ${Math.floor(S.history.length / 2)}\n`);
 }
 
-// ── Voice detection — FIXED: stricter threshold for background noise ─
-// μ-law: 0xFF/0x7F/0x00 is usually silence. Phone lines compress differently,
-// but 2% was too low and caught line hiss. 8% requires actual speech.
+// ── Voice Activity Detection - Energy/RMS based ──────────────
+// μ-law decode then measure RMS energy. Background phone line noise is 
+// typically 50-200 RMS, real speech is 800+. Threshold set at 400.
+function mulawToLinear(u) {
+  u = ~u & 0xFF;
+  const sign = (u & 0x80) ? -1 : 1;
+  const exp  = (u >> 4) & 0x07;
+  const mant = u & 0x0F;
+  return sign * (((mant << 1) | 33)) << (exp + 1);
+}
+
+const ENERGY_THRESHOLD = 150; // tune: lower = more sensitive, higher = stricter
+
 function hasAudio(chunk) {
-  let voice = 0;
+  let sum = 0;
   for (const b of chunk) {
-    if (b !== 0xFF && b !== 0x7F && b !== 0x00) voice++;
+    const s = mulawToLinear(b);
+    sum += s * s;
   }
-  return voice / chunk.length > 0.08; 
+  const rms = Math.sqrt(sum / chunk.length);
+  return rms > ENERGY_THRESHOLD;
 }
 
 // ── Wrap μ-law bytes in WAV container for Gemini ─────────────

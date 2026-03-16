@@ -96,7 +96,7 @@ export function handleMediaStream(ws) {
 
 // ── Greeting ─────────────────────────────────────────────────
 async function greet(S) {
-  const name = process.env.AGENT_NAME || 'Aria';
+  const name = process.env.AGENT_NAME || 'Karishma';
   const company = process.env.COMPANY_NAME || 'our company';
 
   const text = S.direction === 'outbound'
@@ -104,7 +104,14 @@ async function greet(S) {
     : `Hello, thank you for calling CareerGuide! This is ${name} from the support team. How may I help you today?`;
 
   S.history.push({ role: 'model', parts: [{ text }] });
-  await speak(S, text);
+  
+  S.isSpeaking = true;
+  S.markReceived = false;
+  clearSilenceTimer(S);
+  S.audioChunks = [];
+
+  await elevenLabsService.textToSpeechStream(text, (chunk) => sendAudioChunk(S, chunk));
+  sendMark(S);
 }
 
 // ── Arm silence timer ─────────────────────────────────────────
@@ -112,7 +119,9 @@ function armSilenceTimer(S) {
   if (S.silenceTimer) clearTimeout(S.silenceTimer);
   if (S.isSpeaking || S.isProcessing) return;
 
-  const SILENCE_MS = parseInt(process.env.SILENCE_TIMEOUT_MS) || 1800;
+  const baseTimeout = parseInt(process.env.SILENCE_TIMEOUT_MS) || 800;
+  // Dynamic timer: if user spoke for less than ~1.0 sec (50 chunks), trigger processing faster
+  const timeoutMs = S.audioChunks.length < 50 ? 400 : baseTimeout;
   const MAX_CHUNKS = 600; // ~12 seconds of audio max (600 * 20ms)
 
   // Force process if we've collected too much (e.g., continuous background noise)
@@ -134,7 +143,7 @@ function armSilenceTimer(S) {
     }
 
     processAudioBuffer(S);
-  }, SILENCE_MS);
+  }, timeoutMs);
 }
 
 async function processAudioBuffer(S) {
@@ -169,45 +178,34 @@ async function processTurn(S, audioBuffer) {
   // 2. Add to history
   S.history.push({ role: 'user', parts: [{ text: transcript }] });
 
-  // 3. LLM reply
-  const reply = await geminiService.reply(S.history);
+  // 3. Immediately lock state to prevent echo pickup
+  S.isSpeaking = true;
+  S.markReceived = false;
+  clearSilenceTimer(S);
+  S.audioChunks = [];
+
+  // 4. Stream LLM output sentences directly to TTS API, and TTS bytes directly to Twilio WebSocket
+  const reply = await geminiService.replyStream(S.history, async (sentence) => {
+    await elevenLabsService.textToSpeechStream(sentence, (audioChunk) => {
+      sendAudioChunk(S, audioChunk);
+    });
+  });
+
   S.history.push({ role: 'model', parts: [{ text: reply }] });
   console.log(`[Agent] 🤖 Agent: "${reply}"`);
 
-  // 4. Speak reply
-  await speak(S, reply);
+  // 5. Signal TTS chunking is fully complete
+  sendMark(S);
 
-  // 5. Goodbye detection
+  // 6. Goodbye detection
   if (/goodbye|bye|take care|have a great day|talk soon|shubh ho|alvida|shukriya/i.test(reply)) {
     setTimeout(() => hangup(S), 4000);
   }
 }
 
-// ── TTS → μ-law → Twilio ─────────────────────────────────────
-async function speak(S, text) {
-  try {
-    S.isSpeaking = true;
-    S.markReceived = false;
-    clearSilenceTimer(S);
-    S.audioChunks = []; // clear any pre-buffered audio
-
-    const mp3 = await elevenLabsService.textToSpeech(text);
-    const mulaw = await elevenLabsService.mp3ToMulaw(mp3);
-
-    sendAudio(S, mulaw);
-
-  } catch (e) {
-    console.error('[Agent] speak() error:', e.message);
-    S.isSpeaking = false; // recover — don't stay stuck
-  }
-}
-
-// ── Send audio + mark to Twilio ───────────────────────────────
-function sendAudio(S, audioBuffer) {
-  if (!S.ws || S.ws.readyState !== 1) {
-    S.isSpeaking = false;
-    return;
-  }
+// ── Send stream audio chunks natively ─────────────────────────────
+function sendAudioChunk(S, audioBuffer) {
+  if (!S.ws || S.ws.readyState !== 1) return;
 
   const CHUNK = 320; // 20ms @ 8kHz μ-law
   for (let i = 0; i < audioBuffer.length; i += CHUNK) {
@@ -217,8 +215,12 @@ function sendAudio(S, audioBuffer) {
       media: { payload: audioBuffer.slice(i, i + CHUNK).toString('base64') },
     }));
   }
+}
 
-  // Send mark — Twilio echoes it back when audio is done playing
+// ── Send mark ─────────────────────────────────────────────────────
+function sendMark(S) {
+  if (!S.ws || S.ws.readyState !== 1) return;
+
   const markName = `sp_${Date.now()}`;
   S.ws.send(JSON.stringify({
     event: 'mark',
@@ -226,7 +228,7 @@ function sendAudio(S, audioBuffer) {
     mark: { name: markName },
   }));
 
-  console.log(`[Agent] 📤 Sent ${audioBuffer.length} bytes | mark: ${markName}`);
+  console.log(`[Agent] 🚩 Sent mark: ${markName}`);
 
   // SAFETY NET: if mark never comes back within 15s, force unlock
   setTimeout(() => {

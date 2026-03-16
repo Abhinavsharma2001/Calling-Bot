@@ -164,6 +164,56 @@ class GeminiService {
       return "I'm sorry, I didn't catch that. Could you repeat?";
     }
   }
+
+  async replyStream(history, onSentence) {
+    try {
+      const modelName = process.env.GEMINI_MODEL || 'gemini-1.5-flash-8b';
+      const model = getGenAI().getGenerativeModel({
+        model: modelName,
+        systemInstruction: SYSTEM_PROMPT,
+      });
+
+      const turns = history.slice(-12);
+      const last = turns[turns.length - 1];
+      if (!last || last.role !== 'user') return "Sorry, could you say that again?";
+
+      const chatHistory = turns.slice(0, -1);
+      if (chatHistory.length > 0 && chatHistory[0].role === 'model') {
+        chatHistory.shift();
+      }
+
+      const chat = model.startChat({ history: chatHistory });
+      const res = await chat.sendMessageStream(last.parts[0].text);
+
+      let sentenceBuffer = '';
+      let fullText = '';
+      for await (const chunk of res.stream) {
+        const text = chunk.text();
+        fullText += text;
+        sentenceBuffer += text;
+        
+        // Split on punctuation (. ? ! and Hindi Purna Viram ।)
+        const match = sentenceBuffer.match(/([.?!।])(\s|\n|$)/);
+        if (match) {
+          const index = match.index + 1;
+          const sentence = sentenceBuffer.slice(0, index).trim();
+          if (sentence) {
+            await onSentence(sentence);
+          }
+          sentenceBuffer = sentenceBuffer.slice(index);
+        }
+      }
+      
+      if (sentenceBuffer.trim()) {
+        await onSentence(sentenceBuffer.trim());
+      }
+      
+      return fullText.trim();
+    } catch (e) {
+      console.error('[Gemini LLM Stream] Error:', e.message);
+      return "I'm sorry, I didn't catch that. Could you repeat?";
+    }
+  }
 }
 
 export const geminiService = new GeminiService();

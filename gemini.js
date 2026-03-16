@@ -2,13 +2,8 @@
 // src/services/gemini.js — Gemini STT + LLM
 // ============================================================
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { GoogleAIFileManager } from '@google/generative-ai/server';
-import { writeFile, unlink } from 'fs/promises';
-import { tmpdir } from 'os';
-import { join } from 'path';
 
 let genAI;
-let fileManager;
 function getGenAI() {
   if (!genAI) {
     const key = process.env.GEMINI_API_KEY?.trim();
@@ -16,15 +11,6 @@ function getGenAI() {
     genAI = new GoogleGenerativeAI(key);
   }
   return genAI;
-}
-
-function getFileManager() {
-  if (!fileManager) {
-    const key = process.env.GEMINI_API_KEY?.trim();
-    if (!key) throw new Error("GEMINI_API_KEY is missing");
-    fileManager = new GoogleAIFileManager(key);
-  }
-  return fileManager;
 }
 
 const SYSTEM_PROMPT = `You are a professional and friendly calling agent from CareerGuide. CareerGuide provides certification and training courses for career counselling, psychometric testing, and professional development.
@@ -83,62 +69,9 @@ PERSONALITY:
 
 class GeminiService {
 
-  async transcribe(wavBuffer) {
-    let tmpPath = null;
-    let uploadResponse = null;
-
-    try {
-      const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
-      tmpPath = join(tmpdir(), `gemini_in_${id}.wav`);
-      
-      // 1. Write the WAV buffer to disk
-      await writeFile(tmpPath, wavBuffer);
-
-      // 2. Upload to Gemini File API
-      uploadResponse = await getFileManager().uploadFile(tmpPath, {
-        mimeType: 'audio/wav',
-        displayName: `Audio_${id}`,
-      });
-
-      console.log(`[Gemini STT] Uploaded audio file: ${uploadResponse.file.name}`);
-
-      // 3. Request transcription using the fileData URI
-      const modelName = process.env.GEMINI_MODEL || 'gemini-1.5-flash-8b';
-      const model = getGenAI().getGenerativeModel({ model: modelName });
-      const result = await model.generateContent([
-        {
-          fileData: {
-            mimeType: uploadResponse.file.mimeType,
-            fileUri: uploadResponse.file.uri
-          }
-        },
-        { text: 'Transcribe this phone call audio exactly as spoken. Return ONLY the spoken words. If silent or no speech detected, return empty string.' },
-      ]);
-      
-      const text = result.response.text().trim().replace(/^["']|["']$/g, '');
-      if (text) console.log(`[Gemini STT] "${text}"`);
-      return text;
-
-    } catch (e) {
-      console.error('[Gemini STT] Error:', e.message);
-      return '';
-    } finally {
-      // 4. Cleanup local file
-      if (tmpPath) {
-        unlink(tmpPath).catch(() => {});
-      }
-      // 5. Cleanup hosted Gemini file
-      if (uploadResponse?.file?.name) {
-        getFileManager().deleteFile(uploadResponse.file.name).catch(e => {
-          console.error(`[Gemini] Failed to delete remote file: ${e.message}`);
-        });
-      }
-    }
-  }
-
   async reply(history) {
     try {
-      const modelName = process.env.GEMINI_MODEL || 'gemini-1.5-flash-8b';
+      const modelName = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
       const model = getGenAI().getGenerativeModel({
         model: modelName,
         systemInstruction: SYSTEM_PROMPT,
@@ -167,7 +100,7 @@ class GeminiService {
 
   async replyStream(history, onSentence) {
     try {
-      const modelName = process.env.GEMINI_MODEL || 'gemini-1.5-flash-8b';
+      const modelName = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
       const model = getGenAI().getGenerativeModel({
         model: modelName,
         systemInstruction: SYSTEM_PROMPT,

@@ -1,10 +1,21 @@
 // ============================================================
-// src/services/mediaStream.js — Complete AI Calling Agent
-// Works exactly like ElevenLabs native agent
+// src/services/mediaStream.js — AI Calling Agent
+//
+// NEW ARCHITECTURE (with Deepgram):
+//
+//  OLD: chunks → buffer → silence timer → Gemini STT → LLM → TTS
+//       latency: ~3-4 seconds
+//
+//  NEW: chunks → Deepgram stream → speech_final → LLM → TTS
+//       latency: ~1 second
+//
+// Deepgram handles VAD + STT in real-time.
+// We removed: silence timer, audio buffering, wrapMulawAsWav, Gemini STT
 // ============================================================
 
 import { geminiService } from './gemini.js';
 import { elevenLabsService } from './elevenlabs.js';
+import { createDeepgramSession } from './deepgram.js';
 
 export const activeSessions = new Map();
 
@@ -16,12 +27,9 @@ function newSession(callSid, params) {
     phone: params.callerPhone || params.calledPhone || 'unknown',
     direction: params.direction || 'inbound',
     history: [],
-    audioChunks: [],
-    isSpeaking: false,
-    isProcessing: false,
-    silenceTimer: null,
-    listenTimer: null,   // minimum listen window after agent speaks
-    markReceived: false,
+    isSpeaking: false,   // true while ElevenLabs audio is playing
+    isProcessing: false,   // true while LLM/TTS is running
+    dgSession: null,    // Deepgram streaming connection
   };
 }
 
@@ -34,61 +42,54 @@ export function handleMediaStream(ws) {
 
     switch (msg.event) {
 
+      // ── Call connected ──────────────────────────────────────
       case 'start': {
         const p = msg.start.customParameters || {};
         S = newSession(msg.start.callSid, p);
         S.streamSid = msg.start.streamSid;
         S.ws = ws;
         activeSessions.set(S.callSid, S);
+
         console.log(`\n[Agent] ▶ Call started | ${S.direction} | ${S.phone}`);
+
+        // Open Deepgram stream — fires onTranscript when user finishes speaking
+        S.dgSession = createDeepgramSession((transcript) => {
+          onUserSpeech(S, transcript);
+        });
+
+        // Greet after 800ms so Twilio stream is ready
         setTimeout(() => greet(S), 800);
         break;
       }
 
+      // ── Incoming audio from caller ──────────────────────────
       case 'media': {
-        if (!S) break;
+        if (!S || !S.dgSession) break;
 
-        // Drop audio while agent is speaking (echo prevention)
+        // While agent is speaking, don't send echo to Deepgram
         if (S.isSpeaking) break;
 
-        // Drop audio while STT/LLM is running
-        if (S.isProcessing) break;
-
         const chunk = Buffer.from(msg.media.payload, 'base64');
-        const chunkHasAudio = hasAudio(chunk);
-        
-        if (chunkHasAudio) {
-          S.audioChunks.push(chunk);
-          // Only restart the silence timer when there IS speech
-          // This way it properly counts down once user stops talking
-          armSilenceTimer(S);
-        } else if (S.audioChunks.length > 0 && !S.silenceTimer) {
-          // User has spoken before but silence timer somehow died — rearm
-          armSilenceTimer(S);
-        }
+        S.dgSession.send(chunk);
         break;
       }
 
+      // ── Twilio mark: our audio finished playing ─────────────
       case 'mark': {
         if (!S) break;
-        // Twilio confirmed our audio finished playing
-        const markName = msg.mark?.name;
-        if (markName && markName.startsWith('sp_')) {
-          console.log(`[Agent] 🎵 Mark received: ${markName}`);
-          // FIXED: don't rely only on mark to stop speaking
-          // Add a buffer window to let Twilio fully finish playing
+        if (msg.mark?.name?.startsWith('sp_')) {
+          console.log(`[Agent] 🎵 Mark: ${msg.mark.name}`);
           setTimeout(() => {
             if (S) {
               S.isSpeaking = false;
-              S.markReceived = true;
-              S.audioChunks = []; // discard echo
-              console.log('[Agent] ✅ Agent done speaking — listening...');
+              console.log('[Agent] ✅ Done speaking — Deepgram listening...');
             }
-          }, 500); // 500ms grace period after mark
+          }, 300);
         }
         break;
       }
 
+      // ── Call ended ──────────────────────────────────────────
       case 'stop':
         console.log(`[Agent] ⏹ Call ended | SID: ${S?.callSid}`);
         if (S) teardown(S);
@@ -100,120 +101,77 @@ export function handleMediaStream(ws) {
   ws.on('error', e => { console.error('[WS]', e.message); if (S) teardown(S); });
 }
 
-// ── Greeting ─────────────────────────────────────────────────
-async function greet(S) {
-  const name = process.env.AGENT_NAME || 'Karishma';
-  const company = process.env.COMPANY_NAME || 'our company';
-
-  const text = S.direction === 'outbound'
-    ? `Hello, this is the CareerGuide support team calling from our organization. Am I speaking with the right person? May I know your full name, please?`
-    : `Hello, thank you for calling CareerGuide! This is ${name} from the support team. How may I help you today?`;
-
-  S.history.push({ role: 'model', parts: [{ text }] });
-  
-  S.isSpeaking = true;
-  S.markReceived = false;
-  clearSilenceTimer(S);
-  S.audioChunks = [];
-
-  await elevenLabsService.textToSpeechStream(text, (chunk) => sendAudioChunk(S, chunk));
-  sendMark(S);
-}
-
-// ── Arm silence timer ─────────────────────────────────────────
-function armSilenceTimer(S) {
-  if (S.silenceTimer) clearTimeout(S.silenceTimer);
-  if (S.isSpeaking || S.isProcessing) return;
-
-  const baseTimeout = parseInt(process.env.SILENCE_TIMEOUT_MS) || 800;
-  // Dynamic timer: if user spoke for less than ~1.0 sec (50 chunks), trigger processing faster
-  const timeoutMs = S.audioChunks.length < 50 ? 400 : baseTimeout;
-  const MAX_CHUNKS = 600; // ~12 seconds of audio max (600 * 20ms)
-
-  // Force process if we've collected too much (e.g., continuous background noise)
-  if (S.audioChunks.length >= MAX_CHUNKS) {
-    console.log(`[Agent] ⚠️ Max listening duration reached, forcing process...`);
-    processAudioBuffer(S);
+// ── Called by Deepgram when user finishes a sentence ────────
+function onUserSpeech(S, transcript) {
+  // Ignore if agent is speaking or already processing
+  if (S.isSpeaking || S.isProcessing) {
+    console.log(`[Agent] ⏭ Ignored (busy): "${transcript}"`);
     return;
   }
 
-  S.silenceTimer = setTimeout(() => {
-    if (S.isSpeaking || S.isProcessing) return;
-    
-    console.log(`[Agent] ⏱️ Silence timer fired! Chunks in buffer: ${S.audioChunks.length}`);
-
-    if (S.audioChunks.length < 8) {
-      console.log(`[Agent] 🗑️ Buffer too small (< 8 chunks), discarding.`);
-      S.audioChunks = [];
-      return;
-    }
-
-    processAudioBuffer(S);
-  }, timeoutMs);
-}
-
-async function processAudioBuffer(S) {
-  const audio = Buffer.concat(S.audioChunks);
-  S.audioChunks = [];
   S.isProcessing = true;
-
-  console.log(`[Agent] 🎤 Processing ${audio.length} bytes of audio...`);
-
-  try {
-    await processTurn(S, audio);
-  } catch (e) {
-    console.error('[Agent] Turn error:', e.message);
-  } finally {
-    S.isProcessing = false;
-  }
-}
-
-// ── One conversation turn ─────────────────────────────────────
-async function processTurn(S, audioBuffer) {
-  // 1. STT — wrap μ-law in WAV for Gemini
-  const wav = wrapMulawAsWav(audioBuffer);
-  const transcript = await geminiService.transcribe(wav);
-
-  if (!transcript || transcript.trim().length < 2) {
-    console.log('[Agent] 🔇 No speech detected, back to listening');
-    return;
-  }
-
   console.log(`[Agent] 👤 User: "${transcript}"`);
 
-  // 2. Add to history
+  processTurn(S, transcript)
+    .catch(e => console.error('[Agent] Turn error:', e.message))
+    .finally(() => { S.isProcessing = false; });
+}
+
+// ── One full conversation turn ───────────────────────────────
+async function processTurn(S, transcript) {
+  // 1. Add to history
   S.history.push({ role: 'user', parts: [{ text: transcript }] });
 
-  // 3. Immediately lock state to prevent echo pickup
-  S.isSpeaking = true;
-  S.markReceived = false;
-  clearSilenceTimer(S);
-  S.audioChunks = [];
-
-  // 4. Stream LLM output sentences directly to TTS API, and TTS bytes directly to Twilio WebSocket
-  const reply = await geminiService.replyStream(S.history, async (sentence) => {
-    await elevenLabsService.textToSpeechStream(sentence, (audioChunk) => {
-      sendAudioChunk(S, audioChunk);
-    });
-  });
-
+  // 2. Gemini LLM
+  const reply = await geminiService.reply(S.history);
   S.history.push({ role: 'model', parts: [{ text: reply }] });
   console.log(`[Agent] 🤖 Agent: "${reply}"`);
 
-  // 5. Signal TTS chunking is fully complete
-  sendMark(S);
+  // 3. Speak
+  await speak(S, reply);
 
-  // 6. Goodbye detection
+  // 4. Goodbye → hang up after reply finishes
   if (/goodbye|bye|take care|have a great day|talk soon|shubh ho|alvida|shukriya/i.test(reply)) {
     setTimeout(() => hangup(S), 4000);
   }
 }
 
-// ── Send stream audio chunks natively ─────────────────────────────
-function sendAudioChunk(S, audioBuffer) {
-  if (!S.ws || S.ws.readyState !== 1) return;
+// ── Greeting ─────────────────────────────────────────────────
+async function greet(S) {
+  const name = process.env.AGENT_NAME || 'Karishma';
+  const company = process.env.COMPANY_NAME || 'CareerGuide';
 
-  const CHUNK = 320; // 20ms @ 8kHz μ-law
+  const text = S.direction === 'outbound'
+    ? `Hello, this is the ${company} support team calling from our organization. Am I speaking with the right person? May I know your full name, please?`
+    : `Hello, thank you for calling ${company}! This is ${name} from the support team. How may I help you today?`;
+
+  S.history.push({ role: 'model', parts: [{ text }] });
+  await speak(S, text);
+}
+
+// ── TTS → ffmpeg → μ-law → Twilio ───────────────────────────
+async function speak(S, text) {
+  try {
+    S.isSpeaking = true;
+
+    const mp3 = await elevenLabsService.textToSpeech(text);
+    const mulaw = await elevenLabsService.mp3ToMulaw(mp3);
+
+    sendAudio(S, mulaw);
+  } catch (e) {
+    console.error('[Agent] speak() error:', e.message);
+    S.isSpeaking = false;
+  }
+}
+
+// ── Send μ-law audio to Twilio in 20ms chunks ────────────────
+function sendAudio(S, audioBuffer) {
+  if (!S.ws || S.ws.readyState !== 1) {
+    S.isSpeaking = false;
+    return;
+  }
+
+  const CHUNK = 320; // 20ms @ 8kHz
   for (let i = 0; i < audioBuffer.length; i += CHUNK) {
     S.ws.send(JSON.stringify({
       event: 'media',
@@ -221,12 +179,8 @@ function sendAudioChunk(S, audioBuffer) {
       media: { payload: audioBuffer.slice(i, i + CHUNK).toString('base64') },
     }));
   }
-}
 
-// ── Send mark ─────────────────────────────────────────────────────
-function sendMark(S) {
-  if (!S.ws || S.ws.readyState !== 1) return;
-
+  // Mark — Twilio echoes back when playback is complete
   const markName = `sp_${Date.now()}`;
   S.ws.send(JSON.stringify({
     event: 'mark',
@@ -234,14 +188,13 @@ function sendMark(S) {
     mark: { name: markName },
   }));
 
-  console.log(`[Agent] 🚩 Sent mark: ${markName}`);
+  console.log(`[Agent] 📤 Sent ${audioBuffer.length} bytes | mark: ${markName}`);
 
-  // SAFETY NET: if mark never comes back within 15s, force unlock
+  // Safety net: if mark never returns, unlock after 15s
   setTimeout(() => {
-    if (S && S.isSpeaking) {
-      console.warn('[Agent] ⚠️ Mark timeout — forcing isSpeaking=false');
+    if (S?.isSpeaking) {
+      console.warn('[Agent] ⚠️ Mark timeout — force unlock');
       S.isSpeaking = false;
-      S.audioChunks = [];
     }
   }, 15000);
 }
@@ -253,51 +206,9 @@ function hangup(S) {
   }
 }
 
-// ── Cleanup ───────────────────────────────────────────────────
-function clearSilenceTimer(S) {
-  if (S.silenceTimer) { clearTimeout(S.silenceTimer); S.silenceTimer = null; }
-}
-
+// ── Teardown ─────────────────────────────────────────────────
 function teardown(S) {
-  clearSilenceTimer(S);
-  if (S.listenTimer) clearTimeout(S.listenTimer);
+  S.dgSession?.close();
   activeSessions.delete(S.callSid);
   console.log(`[Agent] 🧹 Done | SID: ${S.callSid} | Turns: ${Math.floor(S.history.length / 2)}\n`);
-}
-
-// ── Voice Activity Detection - Energy/RMS based ──────────────
-// μ-law decode then measure RMS energy. Background phone line noise is 
-// typically 50-200 RMS, real speech is 800+. Threshold set at 400.
-function mulawToLinear(u) {
-  u = ~u & 0xFF;
-  const sign = (u & 0x80) ? -1 : 1;
-  const exp  = (u >> 4) & 0x07;
-  const mant = u & 0x0F;
-  return sign * (((mant << 1) | 33)) << (exp + 1);
-}
-
-const ENERGY_THRESHOLD = 150; // tune: lower = more sensitive, higher = stricter
-
-function hasAudio(chunk) {
-  let sum = 0;
-  for (const b of chunk) {
-    const s = mulawToLinear(b);
-    sum += s * s;
-  }
-  const rms = Math.sqrt(sum / chunk.length);
-  return rms > ENERGY_THRESHOLD;
-}
-
-// ── Wrap μ-law bytes in WAV container for Gemini ─────────────
-function wrapMulawAsWav(raw) {
-  const sr = 8000, ch = 1, bps = 8;
-  const hdr = Buffer.alloc(44);
-  hdr.write('RIFF', 0, 'ascii'); hdr.writeUInt32LE(36 + raw.length, 4);
-  hdr.write('WAVE', 8, 'ascii'); hdr.write('fmt ', 12, 'ascii');
-  hdr.writeUInt32LE(16, 16); hdr.writeUInt16LE(7, 20); // 7 = μ-law
-  hdr.writeUInt16LE(ch, 22); hdr.writeUInt32LE(sr, 24);
-  hdr.writeUInt32LE(sr * ch * bps / 8, 28);
-  hdr.writeUInt16LE(ch * bps / 8, 32); hdr.writeUInt16LE(bps, 34);
-  hdr.write('data', 36, 'ascii'); hdr.writeUInt32LE(raw.length, 40);
-  return Buffer.concat([hdr, raw]);
 }

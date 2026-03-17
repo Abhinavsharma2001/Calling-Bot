@@ -3,6 +3,7 @@
 // FIXED: mp3ToMulaw is fully async/await using promises
 // ============================================================
 import axios from 'axios';
+import https from 'https';
 import { exec } from 'child_process';
 import { writeFile, readFile, unlink } from 'fs/promises';
 import { tmpdir } from 'os';
@@ -10,32 +11,45 @@ import { join } from 'path';
 
 class ElevenLabsService {
 
-  async textToSpeech(text) {
-    const apiKey = process.env.ELEVENLABS_API_KEY;
-    const voiceId = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
+  // ── Stream TTS using ElevenLabs (Direct mulaw + Streaming) ──
+  // No ffmpeg needed! Speed is comparable to Deepgram Aura.
+  async streamTTS(text, onChunk) {
+    return new Promise((resolve, reject) => {
+      const apiKey = process.env.ELEVENLABS_API_KEY;
+      const voiceId = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
 
-    console.log(`[ElevenLabs] Requesting TTS: "${text.slice(0, 80)}"`);
+      const options = {
+        method: 'POST',
+        hostname: 'api.elevenlabs.io',
+        path: `/v1/text-to-speech/${voiceId}/stream?output_format=ulaw_8000&optimize_streaming_latency=4`,
+        headers: {
+          'xi-api-key': apiKey,
+          'Content-Type': 'application/json',
+          'accept': 'audio/wav', // ElevenLabs uses this for nested containers even for raw
+        }
+      };
 
-    const res = await axios.post(
-      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`,
-      {
+      const req = https.request(options, (res) => {
+        if (res.statusCode !== 200) {
+          let errBody = '';
+          res.on('data', d => errBody += d);
+          res.on('end', () => reject(new Error(`ElevenLabs streaming failed (${res.statusCode}): ${errBody}`)));
+          return;
+        }
+
+        console.log(`[ElevenLabs] Streaming output...`);
+        res.on('data', chunk => onChunk(chunk));
+        res.on('end', resolve);
+      });
+
+      req.on('error', reject);
+      req.write(JSON.stringify({
         text,
         model_id: 'eleven_turbo_v2_5',
-        voice_settings: { stability: 0.4, similarity_boost: 0.8, style: 0.0, use_speaker_boost: true },
-      },
-      {
-        headers: { 'xi-api-key': apiKey, 'Content-Type': 'application/json' },
-        responseType: 'arraybuffer',
-        timeout: 15000,
-      }
-    ).catch(err => {
-      const msg = err.response?.data ? Buffer.from(err.response.data).toString() : err.message;
-      throw new Error(`[ElevenLabs] TTS failed (${err.response?.status}): ${msg}`);
+        voice_settings: { stability: 0.5, similarity_boost: 0.8 }
+      }));
+      req.end();
     });
-
-    const buf = Buffer.from(res.data);
-    console.log(`[ElevenLabs] TTS success: ${buf.length} bytes`);
-    return buf;
   }
 
   // FIXED: fully async — awaits ffmpeg before returning

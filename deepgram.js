@@ -15,8 +15,6 @@ const DG_URL = 'wss://api.deepgram.com/v1/listen?' + [
   'smart_format=true',
   'interim_results=true',
   'utterance_end_ms=1000',
-  'vad_events=true',
-  'endpointing=300',
 ].join('&');
 
 export function createDeepgramSession(onTranscript) {
@@ -74,8 +72,8 @@ export function createDeepgramSession(onTranscript) {
           process.stdout.write(`\r[Deepgram] 💬 "${text}"   `);
         }
 
-        if (speechFinal && text.length > 1) {
-          onTranscript(text);
+        if (speechFinal && text.length > 2) { 
+          onTranscript(text, true); // true = it's final
           lastTranscript = '';
         }
       }
@@ -83,7 +81,7 @@ export function createDeepgramSession(onTranscript) {
       if (msgType === 'UtteranceEnd') {
         if (lastTranscript?.length > 1) {
           console.log(`\n[Deepgram] 🔚 UtteranceEnd: "${lastTranscript}"`);
-          onTranscript(lastTranscript);
+          onTranscript(lastTranscript, true);
           lastTranscript = '';
         }
       }

@@ -1,6 +1,10 @@
 // ============================================================
-// src/services/deepgram.js — Raw WebSocket to Deepgram
-// FIX: keepalive ping + auto-reconnect on close
+// src/services/deepgram.js
+// FIX 1: onTranscript only fires on speech_final — NOT on every
+//         interim result. Interim results caused Gemini to be
+//         called 10-20x per utterance = confused responses.
+// FIX 2: UtteranceEnd deduplication — don't fire if speech_final
+//         already handled it.
 // ============================================================
 
 import { WebSocket } from 'ws';
@@ -14,15 +18,17 @@ const DG_URL = 'wss://api.deepgram.com/v1/listen?' + [
   'punctuate=true',
   'smart_format=true',
   'interim_results=true',
+  'endpointing=200',
   'utterance_end_ms=1000',
 ].join('&');
 
-export function createDeepgramSession(onTranscript) {
+export function createDeepgramSession(onTranscript, onSpeechStart) {
   const apiKey = process.env.DEEPGRAM_API_KEY;
   if (!apiKey) throw new Error('DEEPGRAM_API_KEY missing in .env');
 
   let closed = false;
-  let lastTranscript = '';
+  let lastFinal = '';
+  let speechFinalFired = false; // dedup flag
   let socket = null;
   let keepaliveTimer = null;
   let ready = false;
@@ -38,16 +44,12 @@ export function createDeepgramSession(onTranscript) {
     socket.on('open', () => {
       console.log('[Deepgram] ✅ Connected');
       ready = true;
-
-      // Flush any queued audio
       for (const chunk of queue) socket.send(chunk);
       queue.length = 0;
 
-      // Send keepalive every 8s to prevent timeout
       keepaliveTimer = setInterval(() => {
-        if (socket?.readyState === 1) {
+        if (socket?.readyState === 1)
           socket.send(JSON.stringify({ type: 'KeepAlive' }));
-        }
       }, 8000);
     });
 
@@ -56,63 +58,64 @@ export function createDeepgramSession(onTranscript) {
       try { data = JSON.parse(raw); } catch { return; }
 
       const msgType = data?.type;
+      const alt = data?.channel?.alternatives?.[0];
+      const text = alt?.transcript?.trim();
+      const isFinal = data?.is_final;
+      const speechFinal = data?.speech_final;
 
       if (msgType === 'Results' || !msgType) {
-        const alt = data?.channel?.alternatives?.[0];
-        const text = alt?.transcript?.trim();
-        const isFinal = data?.is_final;
-        const speechFinal = data?.speech_final;
-
         if (!text) return;
 
-        if (isFinal) {
-          lastTranscript = text;
-          console.log(`\n[Deepgram] ${speechFinal ? '🔚 speech_final' : '📝 final'}: "${text}"`);
-        } else {
+        if (!isFinal) {
+          // Interim — just log, and trigger AI interruption
           process.stdout.write(`\r[Deepgram] 💬 "${text}"   `);
+          if (onSpeechStart) onSpeechStart();
+          return;
         }
 
-        if (speechFinal && text.length > 2) { 
-          onTranscript(text, true); // true = it's final
-          lastTranscript = '';
+        // is_final=true — store it
+        lastFinal = text;
+        console.log(`\n[Deepgram] ${speechFinal ? '🔚 speech_final' : '📝 is_final'}: "${text}"`);
+
+        if (speechFinal) {
+          // Fire once per utterance
+          speechFinalFired = true;
+          onTranscript(text);
+          lastFinal = '';
         }
       }
 
       if (msgType === 'UtteranceEnd') {
-        if (lastTranscript?.length > 1) {
-          console.log(`\n[Deepgram] 🔚 UtteranceEnd: "${lastTranscript}"`);
-          onTranscript(lastTranscript, true);
-          lastTranscript = '';
+        // Only fire if speech_final did NOT already handle this utterance
+        if (!speechFinalFired && lastFinal?.length > 1) {
+          console.log(`\n[Deepgram] 🔚 UtteranceEnd fallback: "${lastFinal}"`);
+          onTranscript(lastFinal);
+          lastFinal = '';
         }
+        // Reset dedup flag for next utterance
+        speechFinalFired = false;
       }
     });
 
-    socket.on('error', (err) => {
-      console.error('[Deepgram] ❌ Error:', err.message);
-    });
+    socket.on('error', (err) => console.error('[Deepgram] ❌', err.message));
 
-    socket.on('close', (code, reason) => {
-      console.log(`[Deepgram] Closed | code: ${code} | reason: ${reason}`);
+    socket.on('close', (code) => {
+      console.log(`[Deepgram] Closed (${code})`);
       ready = false;
       clearInterval(keepaliveTimer);
-
-      // Auto-reconnect unless we deliberately closed
       if (!closed) {
-        console.log('[Deepgram] 🔄 Reconnecting in 1s...');
+        console.log('[Deepgram] 🔄 Reconnecting...');
         setTimeout(connect, 1000);
       }
     });
   }
 
-  connect(); // initial connection
+  connect();
 
   return {
     send(chunk) {
       if (closed) return;
-      if (!ready || socket?.readyState !== 1) {
-        queue.push(chunk); // buffer until reconnected
-        return;
-      }
+      if (!ready || socket?.readyState !== 1) { queue.push(chunk); return; }
       try { socket.send(chunk); } catch { }
     },
     close() {

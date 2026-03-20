@@ -11,6 +11,7 @@ function getGenAI() {
 const SYSTEM_PROMPT = `You are a professional and friendly calling agent from CareerGuide. CareerGuide provides certification and training courses for career counselling, psychometric testing, and professional development.
 
 LANGUAGE RULES:
+- Primary languages: Hindi and English.
 - Automatically detect the language the user speaks.
 - If the user speaks English, reply in English.
 - If the user speaks Hindi, reply in Hindi.
@@ -56,11 +57,13 @@ OR
 - Immediately end the call after saying goodbye.
 - Do not remain silent or continue speaking after goodbye.
 
-PERSONALITY:
-- Friendly, professional, and helpful.
-- Speak like a real human.
-- Do not speak long paragraphs.
-- Always wait for the user's response.`;
+PERSONALITY & SPEECH STYLE:
+- Friendly, professional, and helpful CareerGuide expert.
+- **Natural Hinglish**: Mix Hindi and English naturally (e.g., "Aapka background kya hai?" instead of very formal Hindi).
+- **Human-like Fillers**: Use subtle fillers like "Theek hai...", "Toh...", "Aah...", or "Oh, I see" at the start of sentences to sound less robotic.
+- **Short & Punchy**: Never speak long paragraphs. One or two short sentences at a time.
+- **Authentic Accent**: Avoid perfectly grammatical complex sentences. Speak like you are on a real phone call.
+- Always wait for the user's response after a question.`;
 
 class GeminiService {
 
@@ -68,7 +71,7 @@ class GeminiService {
   async reply(history) {
     try {
       const model = getGenAI().getGenerativeModel({
-        model: process.env.GEMINI_MODEL || 'gemini-2.0-flash',
+        model: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
         systemInstruction: SYSTEM_PROMPT,
       });
       const turns = history.slice(-12);
@@ -94,87 +97,121 @@ class GeminiService {
   // ── Streaming reply → calls onSentence for each sentence ─
   // Starts calling onSentence as soon as first sentence is ready
   // Total latency = time to first sentence (~200-400ms) not full reply
-  async replyStreaming(history, onSentence, onDone) {
-    try {
-      const model = getGenAI().getGenerativeModel({
-        model: process.env.GEMINI_MODEL || 'gemini-2.0-flash',
-        systemInstruction: SYSTEM_PROMPT,
-      });
+  async replyStreaming(history, onSentence, onDone, shouldAbort = () => false) {
+    let retries = 3;
+    let delay = 1000;
 
-      const turns = history.slice(-12);
-      const last = turns[turns.length - 1];
-      if (!last || last.role !== 'user') {
-        await onSentence("Sorry, could you say that again?");
-        onDone("Sorry, could you say that again?");
+    while (retries > 0) {
+      try {
+        const modelName = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+        console.log(`[Gemini] Using model: ${modelName}`);
+
+        const model = getGenAI().getGenerativeModel({
+          model: modelName,
+          systemInstruction: SYSTEM_PROMPT,
+        });
+
+        const turns = history.slice(-12);
+        const last = turns[turns.length - 1];
+        if (!last || last.role !== 'user') {
+          await onSentence("Sorry, could you say that again?");
+          onDone("Sorry, could you say that again?");
+          return;
+        }
+
+        const chatHistory = turns.slice(0, -1);
+        if (chatHistory.length > 0 && chatHistory[0].role === 'model') {
+          chatHistory.shift();
+        }
+
+        const chat = model.startChat({ history: chatHistory });
+        const result = await chat.sendMessageStream(last.parts[0].text);
+
+        let buffer = '';
+        let fullText = '';
+        let firstSentenceFired = false;
+        let startStreamTime = Date.now();
+
+        for await (const chunk of result.stream) {
+          if (firstSentenceFired === false) {
+             console.log(`[Latency] ⏱️ Gemini Time to First Token: ${Date.now() - startStreamTime}ms`);
+          }
+          if (shouldAbort()) {
+            console.log('[Gemini] 🛑 Aborting stream due to interruption');
+            return;
+          }
+
+          const token = chunk.text();
+          buffer += token;
+          fullText += token;
+
+          // FAST-START: For the very first chunk, split on first comma or 3 words
+          if (!firstSentenceFired) {
+             const words = buffer.trim().split(/\s+/);
+             if (words.length >= 3 || buffer.includes(',') || buffer.includes('.') || buffer.includes('?') || buffer.includes('!')) {
+                const parts = buffer.split(/(?<=[.!?।,:])\s+/);
+                if (parts.length > 1 || words.length >= 4) {
+                   const s = parts[0].trim();
+                   if (s.length > 1) {
+                      console.log(`[Gemini fast-start] sentence: "${s}"`);
+                      firstSentenceFired = true;
+                      await onSentence(s);
+                      buffer = buffer.slice(buffer.indexOf(s) + s.length).trim();
+                   }
+                }
+             }
+          }
+
+          const sentences = splitSentences(buffer);
+          if (sentences.length > 1) {
+            for (let i = 0; i < sentences.length - 1; i++) {
+              if (shouldAbort()) return;
+
+              const s = sentences[i].trim();
+              if (s.length > 2) {
+                console.log(`[Gemini streaming] sentence: "${s}"`);
+                await onSentence(s);
+              }
+            }
+            buffer = sentences[sentences.length - 1];
+          }
+        }
+
+        if (!shouldAbort() && buffer.trim().length > 2) {
+          console.log(`[Gemini streaming] final: "${buffer.trim()}"`);
+          await onSentence(buffer.trim());
+        }
+
+        console.log(`[Gemini LLM] full: "${fullText.trim()}"`);
+        if (!shouldAbort()) onDone(fullText.trim());
+        return; // Success!
+
+      } catch (e) {
+        if (shouldAbort()) return;
+        
+        if (e.message.includes('429') && retries > 1) {
+          console.warn(`[Gemini] ⚠️ 429 Quota hit. Retrying in ${delay}ms... (${retries - 1} left)`);
+          await new Promise(r => setTimeout(r, delay));
+          retries--;
+          delay *= 2;
+          continue;
+        }
+
+        console.error('[Gemini streaming] Error:', e.message);
+        let errMsg = "I'm sorry, I didn't catch that. Could you repeat?";
+        await onSentence(errMsg);
+        onDone(errMsg);
         return;
       }
-
-      const chatHistory = turns.slice(0, -1);
-      if (chatHistory.length > 0 && chatHistory[0].role === 'model') {
-        chatHistory.shift();
-      }
-
-      const chat = model.startChat({ history: chatHistory });
-      const result = await chat.sendMessageStream(last.parts[0].text);
-
-      let buffer = '';
-      let fullText = '';
-
-      for await (const chunk of result.stream) {
-        const token = chunk.text();
-        buffer += token;
-        fullText += token;
-
-        // Fire onSentence at sentence boundaries
-        // This lets TTS start immediately on first sentence
-        const sentences = splitSentences(buffer);
-        if (sentences.length > 1) {
-          // All complete sentences except the last (may be incomplete)
-          for (let i = 0; i < sentences.length - 1; i++) {
-            const s = sentences[i].trim();
-            if (s.length > 2) {
-              console.log(`[Gemini streaming] sentence: "${s}"`);
-              await onSentence(s);
-            }
-          }
-          buffer = sentences[sentences.length - 1]; // keep remainder
-        }
-      }
-
-      // Flush remaining buffer
-      if (buffer.trim().length > 2) {
-        console.log(`[Gemini streaming] final: "${buffer.trim()}"`);
-        await onSentence(buffer.trim());
-      }
-
-      console.log(`[Gemini LLM] full: "${fullText.trim()}"`);
-      onDone(fullText.trim());
-
-    } catch (e) {
-      console.error('[Gemini streaming] Error:', e.message);
-      await onSentence("I'm sorry, I didn't catch that. Could you repeat?");
-      onDone("I'm sorry, I didn't catch that. Could you repeat?");
     }
   }
 }
 
-// Split text into sentences at . ! ? boundaries OR every ~8 words for extreme speed
+// Split text into small chunks to start TTS as soon as possible
 function splitSentences(text) {
-  // First split by punctuation
+  // Only split by major sentence headers to avoid excessive 429s from too many small TTS calls
   const parts = text.split(/(?<=[.!?।])\s+/);
-  
-  const finalParts = [];
-  for (const p of parts) {
-    const words = p.trim().split(/\s+/);
-    // If a part is too long (e.g. 10 words), split it anyway to start TTS
-    if (words.length > 10) {
-      finalParts.push(words.slice(0, 8).join(' ') + '...');
-      finalParts.push(words.slice(8).join(' '));
-    } else {
-      finalParts.push(p);
-    }
-  }
-  return finalParts;
+  return parts.filter(p => p.trim().length > 0);
 }
 
 export const geminiService = new GeminiService();

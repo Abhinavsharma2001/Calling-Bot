@@ -19,8 +19,10 @@ const AURA_VOICE = process.env.DEEPGRAM_VOICE || 'aura-2-thalia-en'; // female E
 // ── Stream TTS audio chunks via callback ─────────────────────
 // onChunk(mulawBuffer) called as audio arrives
 // Returns promise that resolves when all audio is sent
-export function streamTTS(text, onChunk) {
+export function streamTTS(text, onChunk, shouldAbort = () => false) {
     return new Promise((resolve, reject) => {
+        if (shouldAbort()) return resolve();
+        
         const apiKey = process.env.DEEPGRAM_API_KEY;
 
         const body = JSON.stringify({ text });
@@ -47,6 +49,10 @@ export function streamTTS(text, onChunk) {
             console.log(`[Aura TTS] Streaming "${text.slice(0, 60)}..."`);
 
             res.on('data', (chunk) => {
+                if (shouldAbort()) {
+                    req.destroy();
+                    return resolve();
+                }
                 // Deepgram streams raw mulaw chunks — send directly to Twilio
                 onChunk(chunk);
             });

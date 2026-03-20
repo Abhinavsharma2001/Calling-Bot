@@ -1,83 +1,121 @@
-// ============================================================
-// src/services/elevenlabs.js — ElevenLabs TTS only (not agent)
-// FIXED: mp3ToMulaw is fully async/await using promises
-// ============================================================
 import axios from 'axios';
-import https from 'https';
-import { exec } from 'child_process';
-import { writeFile, readFile, unlink } from 'fs/promises';
-import { tmpdir } from 'os';
-import { join } from 'path';
 
 class ElevenLabsService {
-
-  // ── Stream TTS using ElevenLabs (Direct mulaw + Streaming) ──
-  // No ffmpeg needed! Speed is comparable to Deepgram Aura.
-  async streamTTS(text, onChunk) {
-    return new Promise((resolve, reject) => {
-      const apiKey = process.env.ELEVENLABS_API_KEY;
-      const voiceId = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
-
-      const options = {
-        method: 'POST',
-        hostname: 'api.elevenlabs.io',
-        path: `/v1/text-to-speech/${voiceId}/stream?output_format=ulaw_8000&optimize_streaming_latency=4`,
-        headers: {
-          'xi-api-key': apiKey,
-          'Content-Type': 'application/json',
-          'accept': 'audio/wav', // ElevenLabs uses this for nested containers even for raw
-        }
-      };
-
-      const req = https.request(options, (res) => {
-        if (res.statusCode !== 200) {
-          let errBody = '';
-          res.on('data', d => errBody += d);
-          res.on('end', () => reject(new Error(`ElevenLabs streaming failed (${res.statusCode}): ${errBody}`)));
-          return;
-        }
-
-        console.log(`[ElevenLabs] Streaming output...`);
-        res.on('data', chunk => onChunk(chunk));
-        res.on('end', resolve);
-      });
-
-      req.on('error', reject);
-      req.write(JSON.stringify({
-        text,
-        model_id: 'eleven_turbo_v2_5',
-        voice_settings: { stability: 0.5, similarity_boost: 0.8 }
-      }));
-      req.end();
-    });
+  constructor() {
+    this.apiKey = process.env.ELEVENLABS_API_KEY;
   }
 
-  // FIXED: fully async — awaits ffmpeg before returning
-  async mp3ToMulaw(mp3Buffer) {
-    const id = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    const inp = join(tmpdir(), `el_in_${id}.mp3`);
-    const out = join(tmpdir(), `el_out_${id}.raw`);
+  // Pure JS 16-bit PCM to 8-bit μ-law (G.711) converter
+  pcmToMulaw(pcmBuffer) {
+    const BIAS = 132;
+    const CLIP = 32635;
+    const encodeMap = [
+      0, 0, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+      4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+      5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+      5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+      6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+      6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+      6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+      6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+      7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+      7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+      7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+      7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+      7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+      7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+      7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+      7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7
+    ];
 
-    try {
-      await writeFile(inp, mp3Buffer);
+    const mulaw = Buffer.alloc(pcmBuffer.length / 2);
+    for (let i = 0; i < pcmBuffer.length; i += 2) {
+      let sample = pcmBuffer.readInt16LE(i);
+      let sign = (sample < 0) ? 0x80 : 0x00;
+      if (sample < 0) sample = -sample;
+      if (sample > CLIP) sample = CLIP;
+      sample += BIAS;
 
-      // Run ffmpeg and wait for it to finish
-      await new Promise((resolve, reject) => {
-        const cmd = `ffmpeg -y -i "${inp}" -ar 8000 -ac 1 -codec:a pcm_mulaw -f mulaw "${out}"`;
-        console.log(`[ffmpeg] Running: ${cmd}`);
-        exec(cmd, (error, stdout, stderr) => {
-          if (error) reject(new Error(`ffmpeg failed: ${stderr || error.message}`));
-          else resolve();
+      let exponent = encodeMap[(sample >> 7) & 0xFF];
+      let mantissa = (sample >> (exponent + 3)) & 0x0F;
+      let val = ~(sign | (exponent << 4) | mantissa);
+      mulaw[i / 2] = val;
+    }
+    return mulaw;
+  }
+
+  async streamTTS(text, onChunk, shouldAbort = () => false) {
+    if (shouldAbort()) return;
+
+    let retries = 3;
+    let delay = 1000;
+
+    while (retries > 0) {
+      try {
+        const apiKey = this.apiKey;
+        const voiceId = process.env.ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
+        const ttsStartTime = Date.now();
+        let firstTTSChunkReceived = false;
+        let leftover = Buffer.alloc(0);
+
+        // Output format: pcm_8000 (16-bit PCM at 8kHz). Direct map to Twilio.
+        const response = await axios({
+          method: 'post',
+          url: `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=pcm_8000`,
+          data: {
+            text,
+            model_id: 'eleven_turbo_v2_5',
+            voice_settings: { stability: 0.5, similarity_boost: 0.75, style: 0.35, use_speaker_boost: true }
+          },
+          headers: { 'xi-api-key': apiKey, 'Content-Type': 'application/json' },
+          responseType: 'stream',
+          timeout: 10000
         });
-      });
 
-      const buf = await readFile(out);
-      console.log(`[ffmpeg] μ-law output: ${buf.length} bytes`);
-      return buf;
+        await new Promise((resolve, reject) => {
+          response.data.on('data', (chunk) => {
+            if (shouldAbort()) {
+              response.data.destroy();
+              return resolve();
+            }
+            if (!firstTTSChunkReceived) {
+              firstTTSChunkReceived = true;
+              console.log(`[Latency] ⏱️ ElevenLabs Time to First Audio: ${Date.now() - ttsStartTime}ms (No-FFmpeg)`);
+            }
 
-    } finally {
-      unlink(inp).catch(() => { });
-      unlink(out).catch(() => { });
+            // Combine with previous leftover bytes
+            let pcmBuffer = Buffer.concat([leftover, chunk]);
+            
+            // If odd number of bytes, save the last byte for next chunk
+            if (pcmBuffer.length % 2 !== 0) {
+              leftover = pcmBuffer.subarray(pcmBuffer.length - 1);
+              pcmBuffer = pcmBuffer.subarray(0, pcmBuffer.length - 1);
+            } else {
+              leftover = Buffer.alloc(0);
+            }
+
+            if (pcmBuffer.length > 0) {
+              const mulaw = this.pcmToMulaw(pcmBuffer);
+              onChunk(mulaw);
+            }
+          });
+
+          response.data.on('end', resolve);
+          response.data.on('error', reject);
+        });
+
+        return; 
+      } catch (err) {
+        if (shouldAbort()) return;
+        const is429 = err.response?.status === 429 || err.message.includes('429');
+        if (is429 && retries > 1) {
+          console.warn(`[ElevenLabs] ⚠️ 429. Retrying in ${delay}ms...`);
+          await new Promise(r => setTimeout(r, delay));
+          retries--; delay *= 2; continue;
+        }
+        console.error(`[ElevenLabs] ❌ Stream Error:`, err.message);
+        return;
+      }
     }
   }
 }

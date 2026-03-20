@@ -2,11 +2,11 @@
   "name": "ai-calling-backend",
   "version": "1.0.0",
   "description": "Cost-optimized AI calling backend: Twilio + ElevenLabs TTS + Gemini + Freshsales",
-  "main": "src/index.js",
+  "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "nodemon src/index.js",
+    "start": "node index.js",
+    "dev": "nodemon index.js",
     "tunnel": "npx localtunnel --port 3000"
   },
   "dependencies": {

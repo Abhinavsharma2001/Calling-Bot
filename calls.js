@@ -12,7 +12,7 @@ import twilio from 'twilio';
 import { activeSessions } from './mediaStream.js';
 
 const router = Router();
-const getTwilioClient = () => twilio(
+export const getTwilioClient = () => twilio(
   process.env.TWILIO_ACCOUNT_SID,
   process.env.TWILIO_AUTH_TOKEN
 );

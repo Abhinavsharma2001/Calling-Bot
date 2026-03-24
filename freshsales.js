@@ -9,7 +9,7 @@
 
 import axios from 'axios';
 
-class FreshsalesService {
+export class FreshsalesService {
   constructor() {
     this.apiKey = process.env.FRESHSALES_API_KEY;
     this.domain = process.env.FRESHSALES_DOMAIN;
@@ -25,8 +25,17 @@ class FreshsalesService {
     });
   }
 
+  async listSalesActivityTypes() {
+    try {
+      const res = await this.client.get('/selector/sales_activity_types');
+      console.log('[Freshsales] Available Activity Types:', JSON.stringify(res.data, null, 2));
+    } catch (err) {
+      console.log('[Freshsales] Could not list activity types:', err.message);
+    }
+  }
+
   // ── Upsert Contact ─────────────────────────────────────────
-  // Creates contact if not found, or returns existing
+  // Creates contact if not found, or returns { contact, isNew }
   async upsertContact({ phone, source, callSid }) {
     if (!this.apiKey || !this.domain) {
       console.log('[Freshsales] Skipping — API key not configured');
@@ -34,12 +43,22 @@ class FreshsalesService {
     }
 
     try {
-      // Search for existing contact by phone
-      const searchRes = await this.client.get('/contacts/search', {
-        params: { q: phone, include: 'owner' },
+      // 1. Try search with exact phone (e.g. +91...)
+      let searchRes = await this.client.get('/contacts/search', {
+        params: { q: encodeURIComponent(phone), include: 'owner' },
       });
 
-      const existing = searchRes.data?.contacts?.[0];
+      let existing = searchRes.data?.contacts?.[0];
+      
+      // 2. Try search without '+' as fallback
+      if (!existing && phone.startsWith('+')) {
+        const noPlus = phone.substring(1);
+        searchRes = await this.client.get('/contacts/search', {
+          params: { q: encodeURIComponent(noPlus), include: 'owner' },
+        });
+        existing = searchRes.data?.contacts?.[0];
+      }
+
       if (existing) {
         console.log(`[Freshsales] Found existing contact: ${existing.id}`);
         return existing;
@@ -50,16 +69,14 @@ class FreshsalesService {
         contact: {
           mobile_number: phone,
           email: `call_${Date.now()}@placeholder.ai`,
-          lead_source_id: 3,         // Phone — adjust based on your Freshsales setup
-          custom_field: {
-            call_sid: callSid,
-            lead_source_channel: source,
-          },
+          lead_source_id: 3,
         },
       });
 
-      console.log(`[Freshsales] Contact created: ${createRes.data?.contact?.id}`);
-      return createRes.data?.contact;
+      const contact = createRes.data?.contact;
+      console.log(`[Freshsales] Contact created: ${contact?.id}`);
+
+      return contact;
 
     } catch (err) {
       console.error('[Freshsales] upsertContact error:', err.response?.data || err.message);
@@ -67,55 +84,101 @@ class FreshsalesService {
     }
   }
 
-  // ── Log Call Activity ──────────────────────────────────────
-  async logCallActivity({ callSid, status, duration, phone }) {
+  // ── Log Call Activity (Shows up in the main Timeline) ──────
+  async logCallActivity({ callSid, status, duration, phone, contactId }) {
     if (!this.apiKey || !this.domain) return;
 
     try {
-      // Find contact first
-      const contact = await this.upsertContact({ phone, source: 'call_end', callSid });
-      if (!contact?.id) return;
+      // Use provided ID or upsert
+      let cid = contactId;
+      if (!cid) {
+        const contact = await this.upsertContact({ phone, source: 'call_end', callSid });
+        cid = contact?.id;
+      }
+      if (!cid) return;
 
-      // Log as a Sales Activity in Freshsales
-      await this.client.post('/sales_activities', {
-        sales_activity: {
-          sales_activity_type_id: 1,        // Phone Call type — adjust as needed
-          title: `AI Call — ${status} (${duration}s)`,
-          start_date: new Date().toISOString(),
-          end_date: new Date().toISOString(),
-          targetable_type: 'Contact',
-          targetable_id: contact.id,
-          notes: `Call SID: ${callSid} | Duration: ${duration}s | Status: ${status}`,
-        },
-      });
-
-      console.log(`[Freshsales] Call activity logged for contact ${contact.id}`);
-
+      // Use the verified Phone activity ID (402002087327). Fallback to Task (402002087325)
+      try {
+        await this.client.post('/sales_activities', {
+          sales_activity: {
+            sales_activity_type_id: 402002087327, 
+            title: `AI Outbound Call — ${status}`,
+            notes: `Duration: ${duration}s | Call SID: ${callSid}`,
+            targetable_type: 'Contact',
+            targetable_id: cid,
+            start_date: new Date().toISOString(),
+            end_date: new Date().toISOString(), 
+          },
+        });
+        console.log(`[Freshsales] Activity logged for contact ${cid}`);
+      } catch (e) {
+         // Silently fail activity logging if not supported — summary note will still be added
+         console.warn('[Freshsales] Timeline Activity failed (expected), relying on Note summary.');
+      }
     } catch (err) {
       console.error('[Freshsales] logCallActivity error:', err.response?.data || err.message);
     }
   }
 
-  // ── Log Conversation Turn ──────────────────────────────────
-  async logConversationTurn({ phone, userSaid, agentSaid, callSid }) {
+  // ── Log Full Conversation Summary (Consolidated Note) ─────
+  async logCallSummary({ phone, callSid, history, contactId, status, duration }) {
     if (!this.apiKey || !this.domain) return;
+    if (!history || history.length < 2) return;
 
     try {
-      const contact = await this.upsertContact({ phone, source: 'conversation', callSid });
-      if (!contact?.id) return;
+      let cid = contactId;
+      if (!cid) {
+        const contact = await this.upsertContact({ phone, source: 'call_summary', callSid });
+        cid = contact?.id;
+      }
+      if (!cid) return;
 
-      // Append note to contact
-      await this.client.post('/notes', {
-        note: {
-          description: `📞 Call Transcript\n\nUser: "${userSaid}"\nAgent: "${agentSaid}"`,
-          targetable_type: 'Contact',
-          targetable_id: contact.id,
-        },
+      // Build concise transcript as plain text (Freshsales might 500 on HTML/complex emojis)
+      const lines = history.map(turn => {
+        const role = turn.role === 'user' ? 'Customer' : 'Agent';
+        const text = turn.parts?.[0]?.text || '';
+        return `${role}: ${text}`;
       });
 
+      const summary =
+        `CALL SUMMARY\n` +
+        `--------------------------\n` +
+        `Status: ${status || 'Completed'}\n` +
+        `Duration: ${duration || 0}s\n` +
+        `Date: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}\n` +
+        `SID: ${callSid}\n\n` +
+        `TRANSCRIPT:\n` +
+        lines.join('\n');
+
+      await this._addNote(cid, summary);
+      console.log(`[Freshsales] Consolidated summary logged for contact ${cid}`);
     } catch (err) {
-      // Non-critical — don't throw
-      console.error('[Freshsales] logConversationTurn error:', err.response?.data || err.message);
+      console.error('[Freshsales] logCallSummary error:', err.response?.data || err.message);
+    }
+  }
+
+  // ── Log Conversation Turn ──────────────────────────────────
+  // (No longer used in real-time — consolidated summary at end)
+  async logConversationTurn() {
+    return;
+  }
+
+  // ── Private: Post a Note to a Contact ─────────────────────
+  async _addNote(contactId, description) {
+    try {
+      // Small delay on new contacts to ensure eventual consistency
+      await new Promise(r => setTimeout(r, 1000));
+
+      const res = await this.client.post('/notes', {
+        note: {
+          description: description,
+          targetable_type: 'Contact',
+          targetable_id: contactId,
+        },
+      });
+      console.log(`[Freshsales] Note created for ID ${contactId} | Status: ${res.status}`);
+    } catch (err) {
+      console.error(`[Freshsales] Failed to add note for ${contactId}:`, err.response?.data || err.message);
     }
   }
 

@@ -11,6 +11,8 @@
 import { createDeepgramSession } from './deepgram.js';
 import { geminiService } from './gemini.js';
 import { elevenLabsService } from './elevenlabs.js';
+import { freshsalesService } from './freshsales.js';
+import { getTwilioClient } from './calls.js';
 
 // Map to track active call sessions for the /calls/active API
 export const activeSessions = new Map();
@@ -28,6 +30,9 @@ export function handleMediaStream(ws) {
   let isAIResponding = false; // Flag to gate interruptions
   let lastUserTranscript = ''; // Prevent self-interruption from echoes
   let lastResponseStartTime = 0; // Lock-out period
+  let crmContact = null; // Freshsales contact reference
+  let callStartTime = Date.now(); // For calculating duration
+  let isClosing = false; // Prevent double cleanup
   
   // Call history for the LLM
   const history = [
@@ -47,6 +52,12 @@ export function handleMediaStream(ws) {
           direction = params.direction || 'inbound';
 
           console.log(`[Media] 📞 Start | SID: ${callSid} | ${direction} | From: ${phone}`);
+          callStartTime = Date.now();
+
+          // ── CRM: Upsert contact immediately on call start ────
+          freshsalesService.upsertContact({ phone, source: direction, callSid })
+            .then(contact => { crmContact = contact; })
+            .catch(err => console.error('[Freshsales] Contact upsert failed:', err.message));
 
           const initialGreeting = history[0].parts[0].text;
 
@@ -68,7 +79,12 @@ export function handleMediaStream(ws) {
 
               console.log(`[Media] 👤 User (final): "${transcript}"`);
               
-              // 3. Update history
+              // 3. STOP any current audio immediately
+              if (ws.readyState === 1 && streamSid) {
+                ws.send(JSON.stringify({ event: 'clear', streamSid }));
+              }
+
+              // 4. Update history
               history.push({ role: 'user', parts: [{ text: transcript }] });
 
               const userStopSpeakingTime = Date.now();
@@ -138,6 +154,21 @@ export function handleMediaStream(ws) {
                     if (shouldAbort()) return;
                     // LLM finished — store response in history
                     history.push({ role: 'model', parts: [{ text: fullText }] });
+
+                    // ── Automatic Hangup Check ────
+                    if (fullText.includes('Goodbye')) {
+                       playbackPromise.then(async () => {
+                          if (shouldAbort()) return;
+                          console.log(`[Media] 👋 Goodbye detected. Ending call (SID: ${callSid})...`);
+                          try {
+                             const twilioClient = getTwilioClient();
+                             await twilioClient.calls(callSid).update({ status: 'completed' });
+                          } catch (err) {
+                             console.error('[Media] Failed to hang up call:', err.message);
+                             ws.close(); // Fallback
+                          }
+                       });
+                    }
                   },
                   shouldAbort
                 );
@@ -161,8 +192,8 @@ export function handleMediaStream(ws) {
                   return;
               }
 
-              // 2. Ignore if we just started a response (1.5s lock-out)
-              if (Date.now() - lastResponseStartTime < 1500) {
+              // 2. Ignore if we just started a response (750ms lock-out)
+              if (Date.now() - lastResponseStartTime < 750) {
                   return;
               }
 
@@ -239,12 +270,35 @@ export function handleMediaStream(ws) {
   });
 
   function cleanup() {
+    if (isClosing) return;
+    isClosing = true;
+
     if (dgSession) {
       dgSession.close();
       dgSession = null;
     }
     if (callSid) {
       activeSessions.delete(callSid);
+
+      // ── CRM: Log call activity on hang-up ──────────────
+      const durationSec = Math.round((Date.now() - callStartTime) / 1000);
+      freshsalesService.logCallActivity({
+        callSid,
+        status: 'completed',
+        duration: durationSec,
+        phone,
+        contactId: crmContact?.id, 
+      }).catch(() => {}); // non-blocking
+
+      // ── CRM: Post full conversation summary note ────────
+      freshsalesService.logCallSummary({
+        callSid,
+        phone,
+        history,
+        contactId: crmContact?.id,
+        status: 'completed',
+        duration: durationSec,
+      }).catch(() => {}); // non-blocking
     }
   }
 }

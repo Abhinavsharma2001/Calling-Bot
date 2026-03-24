@@ -1,4 +1,9 @@
 import axios from 'axios';
+import fs from 'fs';
+import path from 'path';
+
+const CACHE_DIR = path.join(process.cwd(), 'audio_cache');
+
 
 class ElevenLabsService {
   constructor() {
@@ -44,8 +49,37 @@ class ElevenLabsService {
     return mulaw;
   }
 
+  normalizeText(text) {
+    return text.toLowerCase()
+      .replace(/[^\w\s]/g, "") // Remove all non-word chars except spaces
+      .replace(/\s+/g, " ")    // Collapse multiple spaces
+      .trim();
+  }
+
   async streamTTS(text, onChunk, shouldAbort = () => false) {
     if (shouldAbort()) return;
+
+    // 1. Check Audio Cache
+    const normalized = this.normalizeText(text);
+    const fileName = `${normalized.replace(/\s+/g, '_').slice(0, 50)}.mulaw`;
+    const filePath = path.join(CACHE_DIR, fileName);
+
+    if (fs.existsSync(filePath)) {
+      console.log(`[AudioCache] ⚡ Cache Hit: "${normalized}"`);
+      try {
+        const cachedMulaw = fs.readFileSync(filePath);
+        // Stream in chunks of 320 bytes (20ms at 8kHz Mulaw)
+        const CHUNK_SIZE = 320;
+        for (let i = 0; i < cachedMulaw.length; i += CHUNK_SIZE) {
+          if (shouldAbort()) return;
+          onChunk(cachedMulaw.subarray(i, i + CHUNK_SIZE));
+        }
+        return; // Success, don't call API
+      } catch (err) {
+        console.error(`[AudioCache] ❌ Failed to read cache file: ${err.message}`);
+        // Fallback to API if read fails
+      }
+    }
 
     let retries = 3;
     let delay = 1000;
@@ -64,8 +98,8 @@ class ElevenLabsService {
           url: `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=pcm_8000`,
           data: {
             text,
-            model_id: 'eleven_turbo_v2_5',
-            voice_settings: { stability: 0.5, similarity_boost: 0.75, style: 0.35, use_speaker_boost: true }
+            model_id: 'eleven_flash_v2_5',
+            voice_settings: { stability: 0.8, similarity_boost: 0.75, style: 0.1, use_speaker_boost: true }
           },
           headers: { 'xi-api-key': apiKey, 'Content-Type': 'application/json' },
           responseType: 'stream',

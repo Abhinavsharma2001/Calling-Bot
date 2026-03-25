@@ -36,7 +36,7 @@ export function handleMediaStream(ws) {
   
   // Call history for the LLM
   const history = [
-    { role: 'model', parts: [{ text: "Hello, this is the careerguide support team calling from our organization. Am I speaking with the right person? May I know your full name, please?" }] }
+    { role: 'model', parts: [{ text: "Hello, this is the career-guide support team calling from our organization. Am I speaking with the right person? May I know your full name, please?" }] }
   ];
 
   ws.on('message', async (data) => {
@@ -98,6 +98,12 @@ export function handleMediaStream(ws) {
                   async (sentence) => {
                     if (shouldAbort()) return;
 
+                    // ── Voice-Gate: Stop the pipeline for NULL (noise) ────
+                    if (sentence.includes('NULL')) {
+                       console.log("Internal: Background noise detected. Silent ignore.");
+                       return;
+                    }
+
                     const bufferedChunks = [];
                     let isMyTurn = false;
 
@@ -151,7 +157,7 @@ export function handleMediaStream(ws) {
                     })();
                   },
                   (fullText) => {
-                    if (shouldAbort()) return;
+                    if (shouldAbort() || fullText === 'NULL') return;
                     // LLM finished — store response in history
                     history.push({ role: 'model', parts: [{ text: fullText }] });
 

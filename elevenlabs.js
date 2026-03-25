@@ -59,25 +59,44 @@ class ElevenLabsService {
   async streamTTS(text, onChunk, shouldAbort = () => false) {
     if (shouldAbort()) return;
 
-    // 1. Check Audio Cache
-    const normalized = this.normalizeText(text);
-    const fileName = `${normalized.replace(/\s+/g, '_').slice(0, 50)}.mulaw`;
-    const filePath = path.join(CACHE_DIR, fileName);
+    // 1. Check Audio Cache using Intelligent Substring (Fuzzy) Matching
+    const normalized = text.toLowerCase().replace(/[^a-z0-9]/g, '');
+    let matchedFile = null;
 
-    if (fs.existsSync(filePath)) {
-      console.log(`[AudioCache] ⚡ Cache Hit: "${normalized}"`);
+    try {
+      if (fs.existsSync(CACHE_DIR)) {
+        const cacheFiles = fs.readdirSync(CACHE_DIR);
+        for (const file of cacheFiles) {
+          if (!file.endsWith('.mulaw')) continue;
+          
+          // 'have_you_already_enrolled...' -> 'haveyoualreadyenrolled...'
+          const cachePhrase = file.replace('.mulaw', '').replace(/_/g, '');
+          
+          // If Gemini generated "Okay, aapka background kya hai" 
+          // it fully contains "aapkabackgroundkyahai" -> CACHE HIT!
+          if (cachePhrase.length > 5 && normalized.includes(cachePhrase)) {
+            matchedFile = file;
+            break;
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`[AudioCache] ❌ Directory read error:`, err.message);
+    }
+
+    if (matchedFile) {
+      const filePath = path.join(CACHE_DIR, matchedFile);
+      console.log(`[AudioCache] ⚡ Cache Hit (Fuzzy Match): "${matchedFile}"`);
       try {
         const cachedMulaw = fs.readFileSync(filePath);
-        // Stream in chunks of 320 bytes (20ms at 8kHz Mulaw)
         const CHUNK_SIZE = 320;
         for (let i = 0; i < cachedMulaw.length; i += CHUNK_SIZE) {
           if (shouldAbort()) return;
           onChunk(cachedMulaw.subarray(i, i + CHUNK_SIZE));
         }
-        return; // Success, don't call API
+        return; // Success, completely bypass ElevenLabs API
       } catch (err) {
         console.error(`[AudioCache] ❌ Failed to read cache file: ${err.message}`);
-        // Fallback to API if read fails
       }
     }
 

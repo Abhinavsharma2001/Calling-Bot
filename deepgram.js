@@ -11,7 +11,7 @@ import { WebSocket } from 'ws';
 
 const DG_URL = 'wss://api.deepgram.com/v1/listen?' + [
   'model=nova-2',
-  'language=multi',
+  'language=hi',
   'encoding=mulaw',
   'sample_rate=8000',
   'channels=1',

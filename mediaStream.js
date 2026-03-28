@@ -165,6 +165,10 @@ export function handleMediaStream(ws) {
                     if (fullText.includes('Goodbye')) {
                        playbackPromise.then(async () => {
                           if (shouldAbort()) return;
+                          
+                          // Give Twilio an extra 1.5s to empty its final hardware buffer
+                          await new Promise(r => setTimeout(r, 1500));
+                          
                           console.log(`[Media] 👋 Goodbye detected. Ending call (SID: ${callSid})...`);
                           try {
                              const twilioClient = getTwilioClient();

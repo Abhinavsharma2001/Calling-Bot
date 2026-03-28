@@ -69,11 +69,11 @@ class ElevenLabsService {
         for (const file of cacheFiles) {
           if (!file.endsWith('.mulaw')) continue;
           
-          // 'have_you_already_enrolled...' -> 'haveyoualreadyenrolled...'
           const cachePhrase = file.replace('.mulaw', '').replace(/_/g, '');
           
-          // If Gemini generated "Okay, aapka background kya hai" 
-          // it fully contains "aapkabackgroundkyahai" -> CACHE HIT!
+          // DEBUG: Log the match check
+          console.log(`[CacheMatch] Input: "${normalized}" | Checking: "${cachePhrase}"`);
+
           if (cachePhrase.length > 5 && normalized.includes(cachePhrase)) {
             matchedFile = file;
             break;
@@ -93,6 +93,9 @@ class ElevenLabsService {
         for (let i = 0; i < cachedMulaw.length; i += CHUNK_SIZE) {
           if (shouldAbort()) return;
           onChunk(cachedMulaw.subarray(i, i + CHUNK_SIZE));
+          
+          // Wait ~35ms between 40ms chunks to keep the buffer paced
+          await new Promise(resolve => setTimeout(resolve, 35));
         }
         return; // Success, completely bypass ElevenLabs API
       } catch (err) {

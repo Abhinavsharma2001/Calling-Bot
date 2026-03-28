@@ -21,7 +21,7 @@ export class FreshsalesService {
         'Authorization': `Token token=${this.apiKey}`,
         'Content-Type': 'application/json',
       },
-      timeout: 8000,
+      timeout: 30000,
     });
   }
 
@@ -43,22 +43,15 @@ export class FreshsalesService {
     }
 
     try {
-      // 1. Try search with exact phone (e.g. +91...)
-      let searchRes = await this.client.get('/contacts/search', {
-        params: { q: encodeURIComponent(phone), include: 'owner' },
+      console.log(`[Freshsales] Upserting contact for phone: ${phone}`);
+      
+      // 1. Single efficient search
+      const searchRes = await this.client.get('/contacts/search', {
+        params: { q: encodeURIComponent(phone) },
       });
 
       let existing = searchRes.data?.contacts?.[0];
       
-      // 2. Try search without '+' as fallback
-      if (!existing && phone.startsWith('+')) {
-        const noPlus = phone.substring(1);
-        searchRes = await this.client.get('/contacts/search', {
-          params: { q: encodeURIComponent(noPlus), include: 'owner' },
-        });
-        existing = searchRes.data?.contacts?.[0];
-      }
-
       if (existing) {
         console.log(`[Freshsales] Found existing contact: ${existing.id}`);
         return existing;
@@ -79,45 +72,23 @@ export class FreshsalesService {
       return contact;
 
     } catch (err) {
-      console.error('[Freshsales] upsertContact error:', err.response?.data || err.message);
+      const errorMsg = err.response?.data?.errors?.message?.[0] || err.message;
+      
+      // If the error is about duplicate contact, just log it as a info/warning rather than an error
+      if (err.response?.status === 400 && errorMsg.includes('Something went wrong')) {
+        console.log(`[Freshsales] Contact for ${phone} likely already exists (duplicate mobile_number). skipping create.`);
+        return null;
+      }
+
+      console.error('[Freshsales] upsertContact error:', errorMsg);
       return null;
     }
   }
 
   // ── Log Call Activity (Shows up in the main Timeline) ──────
   async logCallActivity({ callSid, status, duration, phone, contactId }) {
-    if (!this.apiKey || !this.domain) return;
-
-    try {
-      // Use provided ID or upsert
-      let cid = contactId;
-      if (!cid) {
-        const contact = await this.upsertContact({ phone, source: 'call_end', callSid });
-        cid = contact?.id;
-      }
-      if (!cid) return;
-
-      // Use the verified Phone activity ID (402002087327). Fallback to Task (402002087325)
-      try {
-        await this.client.post('/sales_activities', {
-          sales_activity: {
-            sales_activity_type_id: 402002087327, 
-            title: `AI Outbound Call — ${status}`,
-            notes: `Duration: ${duration}s | Call SID: ${callSid}`,
-            targetable_type: 'Contact',
-            targetable_id: cid,
-            start_date: new Date().toISOString(),
-            end_date: new Date().toISOString(), 
-          },
-        });
-        console.log(`[Freshsales] Activity logged for contact ${cid}`);
-      } catch (e) {
-         // Silently fail activity logging if not supported — summary note will still be added
-         console.warn('[Freshsales] Timeline Activity failed (expected), relying on Note summary.');
-      }
-    } catch (err) {
-      console.error('[Freshsales] logCallActivity error:', err.response?.data || err.message);
-    }
+    // Deprecated: We now log everything powerfully via Tasks in logCallSummary
+    return;
   }
 
   // ── Log Full Conversation Summary (Consolidated Note) ─────
@@ -128,10 +99,15 @@ export class FreshsalesService {
     try {
       let cid = contactId;
       if (!cid) {
+        console.log(`[Freshsales] No contactId provided, searching/creating for ${phone}...`);
         const contact = await this.upsertContact({ phone, source: 'call_summary', callSid });
         cid = contact?.id;
       }
-      if (!cid) return;
+      
+      if (!cid) {
+        console.error(`[Freshsales] ❌ Could not acquire Contact ID. Call summary will be lost!`);
+        return;
+      }
 
       // Build concise transcript as plain text (Freshsales might 500 on HTML/complex emojis)
       const lines = history.map(turn => {
@@ -150,8 +126,26 @@ export class FreshsalesService {
         `TRANSCRIPT:\n` +
         lines.join('\n');
 
+      // 1. Add traditional Note (lives in the Notes tab)
       await this._addNote(cid, summary);
-      console.log(`[Freshsales] Consolidated summary logged for contact ${cid}`);
+      console.log(`[Freshsales] Consolidated note logged for contact ${cid}`);
+
+      // 2. Add Timeline Task (hyper-visible on the front-page Timeline)
+      try {
+        await this.client.post('/tasks', {
+          task: {
+            title: `AI Outbound Call — ${status || 'Completed'}`,
+            description: summary,
+            targetable_type: 'Contact',
+            targetable_id: cid,
+            due_date: new Date().toISOString(),
+            status: 1 // Completed task
+          }
+        });
+        console.log(`[Freshsales] Timeline Task successfully created for contact ${cid}`);
+      } catch (taskErr) {
+        console.error(`[Freshsales] Failed to add Timeline Task:`, taskErr.response?.data || taskErr.message);
+      }
     } catch (err) {
       console.error('[Freshsales] logCallSummary error:', err.response?.data || err.message);
     }

@@ -91,6 +91,8 @@ export function handleMediaStream(ws) {
               let firstChunkSent = false;
               let playbackPromise = Promise.resolve();
 
+              let goodbyeFired = false; // One-shot guard to prevent duplicate Goodbye
+
               try {
                 // 4. Start Gemini Streaming LLM
                 await geminiService.replyStreaming(
@@ -102,6 +104,18 @@ export function handleMediaStream(ws) {
                     if (sentence.includes('NULL')) {
                        console.log("Internal: Background noise detected. Silent ignore.");
                        return;
+                    }
+
+                    // ── One-shot Goodbye guard ────────────────────────────
+                    // If we already played a sentence with "Goodbye", silently
+                    // drop any further sentences so the word is never heard twice.
+                    if (goodbyeFired) {
+                       console.log(`[Media] 🛑 Dropping post-Goodbye sentence: "${sentence.slice(0, 40)}..."`);
+                       return;
+                    }
+                    if (sentence.toLowerCase().includes('goodbye')) {
+                       goodbyeFired = true;
+                       console.log(`[Media] 🎬 Final sentence (Goodbye): "${sentence.slice(0, 60)}..."`);
                     }
 
                     const bufferedChunks = [];
